@@ -30,8 +30,8 @@ CREDENTIALS = {
 class Workflow:
     """Tiny builder: nodes are laid out left to right in the order they are added."""
 
-    def __init__(self, wf_id: str, name: str):
-        self.id, self.name = wf_id, name
+    def __init__(self, wf_id: str, name: str, error_workflow: str | None = None):
+        self.id, self.name, self.error_workflow = wf_id, name, error_workflow
         self.nodes: list[dict] = []
         self.connections: dict[str, dict] = {}
 
@@ -78,7 +78,11 @@ class Workflow:
             "name": self.name,
             "nodes": self.nodes,
             "connections": self.connections,
-            "settings": {"executionOrder": "v1", "saveManualExecutions": True},
+            "settings": {
+                "executionOrder": "v1",
+                "saveManualExecutions": True,
+                **({"errorWorkflow": self.error_workflow} if self.error_workflow else {}),
+            },
             "active": False,
         }
 
@@ -110,10 +114,14 @@ RULES_COMPILER_VERSION = "v2"
 RULE_HASH = f"md5('{RULES_COMPILER_VERSION}:' || extra_criteria_text)"
 
 SQL_START_RUN = """
--- Mark the batch as matching, clear its un-notified matches so a re-run starts
--- clean (already-emailed matches are kept), and count what we are matching.
+=-- Mark the batch as matching and remember this execution's id (the error
+-- workflow uses it to fail exactly this batch if the run crashes). Clear its
+-- un-notified matches so a re-run starts clean; already-emailed matches stay.
 WITH upd AS (
-  UPDATE upload_batches SET status = 'MATCHING' WHERE batch_id = $1::uuid RETURNING 1
+  UPDATE upload_batches
+     SET status = 'MATCHING', error_message = NULL, matching_execution_id = '{{ $execution.id }}'
+   WHERE batch_id = $1::uuid
+  RETURNING 1
 ), cleared AS (
   DELETE FROM matches WHERE batch_id = $1::uuid AND NOT notified RETURNING 1
 )
@@ -214,7 +222,7 @@ SELECT run_id FROM run;
 
 
 def build_matching() -> Workflow:
-    wf = Workflow("lnMatchingWflwB1", "B - User-Loan Matching")
+    wf = Workflow("lnMatchingWflwB1", "B - User-Loan Matching", error_workflow=ERROR_WORKFLOW_ID)
     y, x = 300, 0
     step = 240
 
@@ -366,7 +374,7 @@ SELECT (SELECT n FROM crawled)::int AS crawled_active_products,
 
 
 def build_discovery() -> Workflow:
-    wf = Workflow("lnDiscoveryWflA1", "A - Loan Product Discovery")
+    wf = Workflow("lnDiscoveryWflA1", "A - Loan Product Discovery", error_workflow=ERROR_WORKFLOW_ID)
     step = 240
 
     def at(col: int, row: int = 0) -> tuple[int, int]:
@@ -438,9 +446,48 @@ def build_discovery() -> Workflow:
     return wf
 
 
+# --------------------------------------------------------------------------- #
+# Workflow E: error handler (set as the error workflow of A and B)
+# --------------------------------------------------------------------------- #
+
+ERROR_WORKFLOW_ID = "lnErrorHandlerE1"
+
+# Log the failure; if it was a matching run, mark that run's batch FAILED so the
+# upload page stops waiting. Only a batch still MATCHING is touched.
+SQL_RECORD_FAILURE = """
+=WITH failed_batch AS (
+  UPDATE upload_batches
+     SET status = 'FAILED', error_message = {{ $json.q_reason }}
+   WHERE matching_execution_id = {{ $json.q_execution_id }} AND status = 'MATCHING'
+  RETURNING batch_id
+), logged AS (
+  INSERT INTO workflow_errors (workflow_id, workflow_name, node_name, message,
+                               execution_id, execution_url, batch_id)
+  VALUES ({{ $json.q_workflow_id }}, {{ $json.q_workflow_name }}, {{ $json.q_node }},
+          {{ $json.q_message }}, {{ $json.q_execution_id }}, {{ $json.q_execution_url }},
+          (SELECT batch_id FROM failed_batch LIMIT 1))
+  RETURNING error_id, batch_id
+)
+SELECT error_id, batch_id FROM logged;
+"""
+
+
+def build_error_handler() -> Workflow:
+    wf = Workflow(ERROR_WORKFLOW_ID, "E - Error Handler")
+    trigger = wf.node("On workflow error", "errorTrigger", 1, {}, pos=(0, 300))
+    describe = wf.code("Describe failure", "E/describe_failure.js", pos=(240, 300))
+    record = wf.postgres("Record failure", SQL_RECORD_FAILURE, pos=(480, 300))
+    wf.chain(trigger, describe, record)
+    return wf
+
+
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
-    for wf, filename in [(build_discovery(), "A_loan_discovery.json"), (build_matching(), "B_matching.json")]:
+    for wf, filename in [
+        (build_discovery(), "A_loan_discovery.json"),
+        (build_matching(), "B_matching.json"),
+        (build_error_handler(), "E_error_handler.json"),
+    ]:
         path = OUT / filename
         path.write_text(json.dumps(wf.to_json(), indent=2) + "\n")
         print(f"wrote {path.relative_to(HERE.parent)} ({len(wf.nodes)} nodes)")

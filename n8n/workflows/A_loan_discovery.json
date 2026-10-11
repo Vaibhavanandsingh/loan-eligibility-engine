@@ -475,7 +475,8 @@
   },
   "settings": {
     "executionOrder": "v1",
-    "saveManualExecutions": true
+    "saveManualExecutions": true,
+    "errorWorkflow": "lnErrorHandlerE1"
   },
   "active": false
 }

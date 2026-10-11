@@ -1,0 +1,80 @@
+{
+  "id": "lnErrorHandlerE1",
+  "name": "E - Error Handler",
+  "nodes": [
+    {
+      "id": "lnErrorHandlerE1-01",
+      "name": "On workflow error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "lnErrorHandlerE1-02",
+      "name": "Describe failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Summarise a failed execution from the Error Trigger payload.\n//\n// The payload has { execution: {id, url, error, lastNodeExecuted}, workflow: {id, name} }.\n// When the failure happened inside a trigger node there is no execution yet,\n// and the details arrive under `trigger` instead.\n\nconst data = $input.first().json;\nconst execution = data.execution ?? {};\nconst trigger = data.trigger ?? {};\nconst workflow = data.workflow ?? {};\n\nconst error = execution.error ?? trigger.error ?? {};\nconst message = String(error.message ?? 'Unknown error').replace(/\\s+/g, ' ').slice(0, 1000);\nconst node = execution.lastNodeExecuted ?? error.node?.name ?? null;\nconst reason = `Matching failed at step \"${node ?? 'unknown'}\": ${message}`.slice(0, 500);\n\nconst sqlText = (value) => (value == null ? 'NULL' : `'${String(value).replace(/'/g, \"''\")}'`);\n\nreturn [{\n  json: {\n    workflow_name: workflow.name ?? null,\n    node,\n    message,\n    execution_id: execution.id ?? null,\n    execution_url: execution.url ?? null,\n    q_workflow_id: sqlText(workflow.id),\n    q_workflow_name: sqlText(workflow.name),\n    q_node: sqlText(node),\n    q_message: sqlText(message),\n    q_execution_id: sqlText(execution.id),\n    q_execution_url: sqlText(execution.url),\n    q_reason: sqlText(reason),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "lnErrorHandlerE1-03",
+      "name": "Record failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=WITH failed_batch AS (\n  UPDATE upload_batches\n     SET status = 'FAILED', error_message = {{ $json.q_reason }}\n   WHERE matching_execution_id = {{ $json.q_execution_id }} AND status = 'MATCHING'\n  RETURNING batch_id\n), logged AS (\n  INSERT INTO workflow_errors (workflow_id, workflow_name, node_name, message,\n                               execution_id, execution_url, batch_id)\n  VALUES ({{ $json.q_workflow_id }}, {{ $json.q_workflow_name }}, {{ $json.q_node }},\n          {{ $json.q_message }}, {{ $json.q_execution_id }}, {{ $json.q_execution_url }},\n          (SELECT batch_id FROM failed_batch LIMIT 1))\n  RETURNING error_id, batch_id\n)\nSELECT error_id, batch_id FROM logged;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "On workflow error": {
+      "main": [
+        [
+          {
+            "node": "Describe failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Describe failure": {
+      "main": [
+        [
+          {
+            "node": "Record failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "active": false
+}

@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS upload_batches (
   valid_rows     INT NOT NULL DEFAULT 0,
   invalid_rows   INT NOT NULL DEFAULT 0,
   error_message  TEXT,
+  -- n8n execution id of the Workflow B run matching this batch, so the error
+  -- workflow can mark exactly this batch FAILED if that run crashes.
+  matching_execution_id TEXT,
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at   TIMESTAMPTZ
 );
@@ -97,6 +100,19 @@ CREATE TABLE IF NOT EXISTS matches (
   notified_at  TIMESTAMPTZ,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (user_id, product_id)
+);
+
+-- Every failed n8n execution of Workflows A or B, written by the error workflow (E).
+CREATE TABLE IF NOT EXISTS workflow_errors (
+  error_id       BIGSERIAL PRIMARY KEY,
+  workflow_id    TEXT,
+  workflow_name  TEXT,
+  node_name      TEXT,           -- the step that failed
+  message        TEXT,
+  execution_id   TEXT,
+  execution_url  TEXT,           -- opens the failed run in the n8n editor
+  batch_id       UUID REFERENCES upload_batches(batch_id),
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- One row per Workflow B run: the numbers behind the optimization funnel.

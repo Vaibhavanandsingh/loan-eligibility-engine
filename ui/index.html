@@ -218,8 +218,15 @@ function render(s) {
       notify.set('done', `${fmt(s.notified_matches)} matches emailed`);
       return true;
     case 'FAILED':
-      ingest.set('failed', s.error_message || 'Processing failed');
-      showError(`This upload failed: ${s.error_message || 'unknown error'}. Fix the file and upload it again.`);
+      if (s.completed_at && s.valid_rows > 0) {
+        // Ingestion finished; the failure happened later, in matching.
+        ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
+        match.set('failed', s.error_message || 'Matching failed');
+        showError('Matching failed, but your rows are saved. Matching can be re-run for this batch without uploading again.');
+      } else {
+        ingest.set('failed', s.error_message || 'Processing failed');
+        showError(`This upload failed: ${s.error_message || 'unknown error'}. Fix the file and upload it again.`);
+      }
       return true;
     default:
       return false;

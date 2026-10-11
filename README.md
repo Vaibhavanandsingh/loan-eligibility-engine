@@ -11,6 +11,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
 | `serverless.yml` (API, Lambdas, S3, RDS, DLQ, SES user) | Done, packaged and validated; **not yet deployed** |
 | Workflow A: loan product discovery (crawler) | Done |
 | Workflow B: matching with the optimised funnel | Done |
+| Workflow E: error handler for A and B | Done |
 | Workflow C: email notification via SES | Designed, **not built yet** |
 
 ---
@@ -27,6 +28,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
   - [Workflow A: crawling strategy](#workflow-a-crawling-strategy)
   - [Optimization Treasure Hunt (Workflow B)](#optimization-treasure-hunt-workflow-b)
   - [Workflow C: notification (planned)](#workflow-c-notification-planned)
+  - [Workflow E: error handling](#workflow-e-error-handling)
   - [Security](#security)
 - [Networking and production considerations](#networking-and-production-considerations)
 - [Tests](#tests)
@@ -119,7 +121,7 @@ Workflow A runs independently every night and keeps `loan_products` current. Das
 │   ├── 003_crawl_sources.sql the pages Workflow A crawls
 │   └── seed/seed_products.sql illustrative fallback products
 ├── n8n/
-│   ├── workflows/            importable workflow JSON (A, B)
+│   ├── workflows/            importable workflow JSON (A, B, E)
 │   ├── code/                 JavaScript of each n8n Code node, readable and diffable
 │   └── build.py              assembles code + SQL into the workflow JSON
 ├── ui/index.html             upload page (no build step)
@@ -160,12 +162,16 @@ The schema is created automatically the first time the app database starts.
 3. Import and activate the workflows:
 
 ```bash
-docker exec loan-engine-n8n n8n import:workflow --input=/workflows/A_loan_discovery.json
-docker exec loan-engine-n8n n8n import:workflow --input=/workflows/B_matching.json
-docker exec loan-engine-n8n n8n publish:workflow --id=lnDiscoveryWflA1
-docker exec loan-engine-n8n n8n publish:workflow --id=lnMatchingWflwB1
+for f in E_error_handler A_loan_discovery B_matching; do
+  docker exec loan-engine-n8n n8n import:workflow --input=/workflows/$f.json
+done
+for id in lnErrorHandlerE1 lnDiscoveryWflA1 lnMatchingWflwB1; do
+  docker exec loan-engine-n8n n8n publish:workflow --id=$id
+done
 docker compose restart n8n
 ```
+
+Workflow E must be published too. n8n 2.x refuses to run an error workflow that is not active.
 
 When you open each workflow, n8n asks you to pick the matching credential for any node whose credential id differs from the one in the file.
 
@@ -412,6 +418,17 @@ Designed, not built yet:
 - Matches are marked `notified` **only after SES confirms the send**, so a crash never double-sends and a failure is retried on the next run.
 - A dry-run mode saves the emails to an `email_outbox` table instead of sending them, for review before SES is set up.
 
+### Workflow E: error handling
+
+A and B both name **E · Error Handler** as their n8n *error workflow*, so n8n starts E whenever a production run of either fails.
+- E records the failed workflow, the step, the error message and a link to that run in the n8n editor, in `workflow_errors`.
+- If the failed run was matching a batch, E marks that batch `FAILED` with a readable reason. Workflow B stores its execution id on the batch when it starts, so E fails exactly the right batch, and only while it is still `MATCHING`.
+- The upload page then stops waiting and tells the two cases apart: *"Matching failed, but your rows are saved"* is different from *"this file is broken, upload it again"*. Matching can be re-run for the batch by calling the webhook again, with no re-upload.
+
+**Tested** by renaming `match_runs` while B ran, so its last step failed after the matches were saved. E logged `B - User-Loan Matching · Record run · relation "match_runs" does not exist` with the execution link, and the batch became `FAILED` with that reason. After the table was restored, re-running B returned the batch to `MATCHED`.
+
+Not every problem is a crash. Expected failures are handled inside the workflows instead: Gemini errors degrade to `UNVERIFIED` matches, and failed page fetches are retried the next day.
+
 ### Security
 
 - **Upload links are narrow:** one key, PUT only, Content-Type pinned to `text/csv`, valid for 5 minutes. The bucket blocks all public access and is encrypted at rest.
@@ -454,6 +471,7 @@ The database tests skip themselves if Postgres isn't running.
 
 The n8n workflows were tested end to end against the 10,000-user sample:
 - wrong webhook secret (403), malformed batch id (400)
+- a step failing mid-run (Workflow E logs it and fails the batch)
 - Gemini unavailable (run degrades to `UNVERIFIED`)
 - rule compiling, re-runs with nothing changed (no duplicates, no LLM call)
 - crawl, then an immediate re-crawl (pages skipped)

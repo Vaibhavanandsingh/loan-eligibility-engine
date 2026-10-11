@@ -118,7 +118,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Mark the batch as matching, clear its un-notified matches so a re-run starts\n-- clean (already-emailed matches are kept), and count what we are matching.\nWITH upd AS (\n  UPDATE upload_batches SET status = 'MATCHING' WHERE batch_id = $1::uuid RETURNING 1\n), cleared AS (\n  DELETE FROM matches WHERE batch_id = $1::uuid AND NOT notified RETURNING 1\n)\nSELECT (SELECT count(*) FROM upd)::int                                  AS batch_found,\n       (SELECT count(*) FROM cleared)::int                              AS cleared_matches,\n       (SELECT count(*) FROM users WHERE batch_id = $1::uuid)::int      AS users_in_batch,\n       (SELECT count(*) FROM loan_products WHERE is_active)::int        AS active_products;",
+        "query": "=-- Mark the batch as matching and remember this execution's id (the error\n-- workflow uses it to fail exactly this batch if the run crashes). Clear its\n-- un-notified matches so a re-run starts clean; already-emailed matches stay.\nWITH upd AS (\n  UPDATE upload_batches\n     SET status = 'MATCHING', error_message = NULL, matching_execution_id = '{{ $execution.id }}'\n   WHERE batch_id = $1::uuid\n  RETURNING 1\n), cleared AS (\n  DELETE FROM matches WHERE batch_id = $1::uuid AND NOT notified RETURNING 1\n)\nSELECT (SELECT count(*) FROM upd)::int                                  AS batch_found,\n       (SELECT count(*) FROM cleared)::int                              AS cleared_matches,\n       (SELECT count(*) FROM users WHERE batch_id = $1::uuid)::int      AS users_in_batch,\n       (SELECT count(*) FROM loan_products WHERE is_active)::int        AS active_products;",
         "options": {
           "queryReplacement": "={{ $('Validate request').first().json.batch_id }}"
         }
@@ -596,7 +596,8 @@
   },
   "settings": {
     "executionOrder": "v1",
-    "saveManualExecutions": true
+    "saveManualExecutions": true,
+    "errorWorkflow": "lnErrorHandlerE1"
   },
   "active": false
 }
