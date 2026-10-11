@@ -1,0 +1,4 @@
+# Local development and tests only.
+-r requirements.txt
+boto3==1.35.36
+pytest==8.3.3

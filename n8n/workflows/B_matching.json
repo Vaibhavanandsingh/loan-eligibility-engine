@@ -1,0 +1,602 @@
+{
+  "id": "lnMatchingWflwB1",
+  "name": "B - User-Loan Matching",
+  "nodes": [
+    {
+      "id": "lnMatchingWflwB1-01",
+      "name": "Webhook: batch ingested",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "loan-match",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "5c1b7a2e-9d4f-4b8e-a3c6-1f2e8d9b0a71",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "lnWebhookSecret1",
+          "name": "Webhook secret (Lambda to n8n)"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-02",
+      "name": "Validate request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Validate the webhook body: { \"batch_id\": \"<uuid>\", \"valid_rows\": <int> }.\n// batch_id is later placed into SQL, so anything that is not a UUID is rejected here.\nconst body = $input.first().json.body ?? {};\nconst batchId = String(body.batch_id ?? '').trim().toLowerCase();\nconst isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(batchId);\n\nreturn [{\n  json: {\n    valid: isUuid,\n    batch_id: batchId,\n    started_at: Date.now(),\n    error: isUuid ? null : 'batch_id must be a UUID',\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-03",
+      "name": "Valid batch_id?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Valid batch_id?-cond",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-04",
+      "name": "Respond 202 Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        120
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ accepted: true, batch_id: $json.batch_id }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-05",
+      "name": "Respond 400 Bad Request",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ accepted: false, error: $json.error }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-06",
+      "name": "Start run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        960,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Mark the batch as matching, clear its un-notified matches so a re-run starts\n-- clean (already-emailed matches are kept), and count what we are matching.\nWITH upd AS (\n  UPDATE upload_batches SET status = 'MATCHING' WHERE batch_id = $1::uuid RETURNING 1\n), cleared AS (\n  DELETE FROM matches WHERE batch_id = $1::uuid AND NOT notified RETURNING 1\n)\nSELECT (SELECT count(*) FROM upd)::int                                  AS batch_found,\n       (SELECT count(*) FROM cleared)::int                              AS cleared_matches,\n       (SELECT count(*) FROM users WHERE batch_id = $1::uuid)::int      AS users_in_batch,\n       (SELECT count(*) FROM loan_products WHERE is_active)::int        AS active_products;",
+        "options": {
+          "queryReplacement": "={{ $('Validate request').first().json.batch_id }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-07",
+      "name": "Load stale rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1200,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Products whose text rule has never been compiled, or changed since it was.\nSELECT product_id, product_name, extra_criteria_text, md5(extra_criteria_text) AS text_hash\n  FROM loan_products\n WHERE is_active\n   AND extra_criteria_text IS NOT NULL\n   AND compiled_rules_hash IS DISTINCT FROM md5(extra_criteria_text)\n ORDER BY product_id;",
+        "options": {}
+      },
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-08",
+      "name": "Build compile request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// Stage 2a: compile free-text product rules into structured checks.\n//\n// Input: products whose extra_criteria_text changed since it was last compiled\n// (usually none, so no LLM call is made). All of them go into ONE Gemini request:\n// the LLM translates rules once per product, never once per user.\n\nconst MODEL = 'gemini-2.5-flash';\n\nconst products = $input.all().map((i) => i.json).filter((p) => p.product_id);\nif (products.length === 0) {\n  return [{ json: { count: 0 } }];\n}\n\nconst EMPLOYMENT = ['salaried', 'self_employed', 'business'];\nconst UNKNOWN_DATA = [\n  'employer_category', 'city', 'business_vintage', 'business_turnover',\n  'professional_qualification', 'tax_returns', 'other',\n];\n\n// Gemini structured output: the response must match this schema exactly.\nconst requirement = {\n  type: 'OBJECT',\n  properties: {\n    credit_score_min: { type: 'INTEGER', nullable: true },\n    monthly_income_min: { type: 'NUMBER', nullable: true },\n    age_min: { type: 'INTEGER', nullable: true },\n    age_max: { type: 'INTEGER', nullable: true },\n    employment_in: { type: 'ARRAY', items: { type: 'STRING', enum: EMPLOYMENT }, nullable: true },\n  },\n};\nconst responseSchema = {\n  type: 'ARRAY',\n  items: {\n    type: 'OBJECT',\n    properties: {\n      product_id: { type: 'INTEGER' },\n      kind: { type: 'STRING', enum: ['eligibility', 'informational'] },\n      require: requirement,\n      conditions: {\n        type: 'ARRAY',\n        items: {\n          type: 'OBJECT',\n          properties: {\n            when_employment_in: { type: 'ARRAY', items: { type: 'STRING', enum: EMPLOYMENT } },\n            require: requirement,\n          },\n          required: ['when_employment_in', 'require'],\n        },\n      },\n      needs_unknown_data: { type: 'ARRAY', items: { type: 'STRING', enum: UNKNOWN_DATA } },\n      verification_note: { type: 'STRING' },\n    },\n    required: ['product_id', 'kind', 'require', 'conditions', 'needs_unknown_data', 'verification_note'],\n  },\n};\n\nconst instructions = `You translate the free-text eligibility rules of Indian loan products into machine-checkable JSON.\n\nThe ONLY applicant facts available are:\n- monthly_income (INR per month)\n- credit_score (300-900)\n- age (years)\n- employment_status: one of salaried, self_employed, business\n\nFor each product return one object:\n- product_id: copied from the input.\n- kind: \"eligibility\" if the text can exclude an applicant; \"informational\" if it only describes pricing, loan limits or preferences and never excludes anyone.\n- require: requirements for every applicant, using only these fields: credit_score_min, monthly_income_min, age_min, age_max, employment_in. Use null for fields the text does not set.\n- conditions: requirements that apply only to some employment types, as [{\"when_employment_in\": [...], \"require\": {...}}].\n- needs_unknown_data: facts the rule depends on that are NOT in the applicant data (e.g. employer type, city, years in business, turnover, qualification, tax returns). Empty if none.\n- verification_note: one short sentence for the applicant saying what the lender will verify, or \"\" if nothing.\n\nRules:\n- Never invent thresholds that the text does not state.\n- \"Age at loan maturity must not exceed X\" with a minimum tenure of T years means age_max = X - T.\n- A threshold that depends on an unknown fact (e.g. a higher income needed in metro cities) must not go into require; list the fact in needs_unknown_data instead.\n- Amounts like \"Rs 25,000\", \"25k\", \"1 lakh\" (= 100000) are INR.\n\nProducts:\n${JSON.stringify(products.map((p) => ({\n  product_id: p.product_id,\n  product_name: p.product_name,\n  rule_text: p.extra_criteria_text,\n})), null, 2)}`;\n\nreturn [{\n  json: {\n    count: products.length,\n    model: MODEL,\n    // Remember which text each compile result belongs to (md5 from SQL).\n    text_hashes: Object.fromEntries(products.map((p) => [p.product_id, p.text_hash])),\n    request_body: {\n      contents: [{ role: 'user', parts: [{ text: instructions }] }],\n      generationConfig: {\n        temperature: 0,\n        responseMimeType: 'application/json',\n        responseSchema,\n      },\n    },\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-09",
+      "name": "Any rules to compile?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Any rules to compile?-cond",
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-10",
+      "name": "Gemini: compile rules",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        -60
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $json.model }}:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request_body) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "lnGeminiApiKey01",
+          "name": "Gemini API key"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-11",
+      "name": "Parse compiled rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        -60
+      ],
+      "parameters": {
+        "jsCode": "// Stage 2b: validate Gemini's compiled rules before trusting them.\n//\n// Every field is checked against the allowed names and ranges. A product whose\n// result is malformed is stored as status \"invalid\" (its matches are then flagged\n// UNVERIFIED rather than guessed). If the LLM call itself failed, nothing is\n// stored, so the next run retries the compile.\n\nconst request = $('Build compile request').first().json;\nconst response = $input.first().json;\n\nconst EMPLOYMENT = new Set(['salaried', 'self_employed', 'business']);\nconst UNKNOWN_DATA = new Set([\n  'employer_category', 'city', 'business_vintage', 'business_turnover',\n  'professional_qualification', 'tax_returns', 'other',\n]);\nconst LIMITS = {\n  credit_score_min: [300, 900],\n  monthly_income_min: [0, 100000000],\n  age_min: [18, 100],\n  age_max: [18, 100],\n};\n\n// Postgres string literal; standard_conforming_strings is on, so doubling ' is enough.\nconst sqlLiteral = (value) => `'${JSON.stringify(value).replace(/'/g, \"''\")}'`;\n\nfunction cleanRequirement(raw) {\n  if (raw == null) return {};\n  if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('require must be an object');\n  const out = {};\n  for (const [key, [lo, hi]] of Object.entries(LIMITS)) {\n    const v = raw[key];\n    if (v == null) continue;\n    if (typeof v !== 'number' || !Number.isFinite(v) || v < lo || v > hi) {\n      throw new Error(`${key} out of range: ${v}`);\n    }\n    out[key] = v;\n  }\n  if (raw.employment_in != null) {\n    if (!Array.isArray(raw.employment_in) || !raw.employment_in.every((e) => EMPLOYMENT.has(e))) {\n      throw new Error('employment_in has unknown values');\n    }\n    if (raw.employment_in.length) out.employment_in = raw.employment_in;\n  }\n  return out;\n}\n\nfunction compile(raw) {\n  if (!['eligibility', 'informational'].includes(raw.kind)) throw new Error(`bad kind ${raw.kind}`);\n  const conditions = (raw.conditions ?? []).map((c) => {\n    const when = c.when_employment_in;\n    if (!Array.isArray(when) || when.length === 0 || !when.every((e) => EMPLOYMENT.has(e))) {\n      throw new Error('condition has bad when_employment_in');\n    }\n    return { when_employment_in: when, require: cleanRequirement(c.require) };\n  });\n  const unknown = raw.needs_unknown_data ?? [];\n  if (!Array.isArray(unknown) || !unknown.every((u) => UNKNOWN_DATA.has(u))) {\n    throw new Error('needs_unknown_data has unknown values');\n  }\n  return {\n    status: 'ok',\n    kind: raw.kind,\n    require: cleanRequirement(raw.require),\n    conditions,\n    needs_unknown_data: unknown,\n    verification_note: String(raw.verification_note ?? '').slice(0, 300),\n  };\n}\n\nconst text = response?.candidates?.[0]?.content?.parts?.[0]?.text;\nif (!text) {\n  const reason = response?.error?.message ?? response?.error ?? 'no candidates in response';\n  return [{ json: { llm_ok: false, error: String(reason).slice(0, 500), saved: 0, sql_payload: \"'[]'\" } }];\n}\n\nlet results;\ntry {\n  results = JSON.parse(text);\n  if (!Array.isArray(results)) throw new Error('response is not an array');\n} catch (e) {\n  return [{ json: { llm_ok: false, error: `unparseable LLM output: ${e.message}`, saved: 0, sql_payload: \"'[]'\" } }];\n}\n\nconst byId = new Map(results.map((r) => [Number(r?.product_id), r]));\nconst rows = [];\nconst problems = [];\nfor (const [productId, textHash] of Object.entries(request.text_hashes)) {\n  const raw = byId.get(Number(productId));\n  let compiled;\n  try {\n    if (!raw) throw new Error('missing from LLM output');\n    compiled = compile(raw);\n  } catch (e) {\n    compiled = { status: 'invalid', reason: e.message };\n    problems.push(`product ${productId}: ${e.message}`);\n  }\n  rows.push({ product_id: Number(productId), text_hash: textHash, compiled });\n}\n\nreturn [{\n  json: {\n    llm_ok: true,\n    saved: rows.filter((r) => r.compiled.status === 'ok').length,\n    invalid: problems,\n    compiled_rules: rows,\n    sql_payload: sqlLiteral(rows),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-12",
+      "name": "Save compiled rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2400,
+        -60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=WITH data AS (\n  SELECT * FROM jsonb_to_recordset({{ $json.sql_payload }}::jsonb)\n    AS d(product_id int, text_hash text, compiled jsonb)\n), upd AS (\n  UPDATE loan_products p\n     SET compiled_rules = d.compiled, compiled_rules_hash = d.text_hash, compiled_at = now()\n    FROM data d\n   WHERE p.product_id = d.product_id\n  RETURNING 1\n)\nSELECT count(*)::int AS rules_saved FROM upd;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-13",
+      "name": "Load products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2640,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT product_id, product_name, provider,\n       interest_rate_min::float8  AS interest_rate_min,\n       min_monthly_income::float8 AS min_monthly_income,\n       min_credit_score, extra_criteria_text, compiled_rules,\n       compiled_rules_hash IS NOT DISTINCT FROM md5(extra_criteria_text) AS compiled_current\n  FROM loan_products\n WHERE is_active;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-14",
+      "name": "Load candidates (SQL pre-filter)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2880,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT u.user_id, u.monthly_income::float8 AS income, u.credit_score, u.age, u.employment_status,\n       array_agg(p.product_id ORDER BY p.product_id) AS product_ids\n  FROM users u\n  JOIN loan_products p\n    ON p.is_active\n   AND u.monthly_income >= COALESCE(p.min_monthly_income, 0)\n   AND u.credit_score   >= COALESCE(p.min_credit_score, 300)\n   AND (p.max_credit_score IS NULL OR u.credit_score <= p.max_credit_score)\n   AND u.age BETWEEN COALESCE(p.min_age, 18) AND COALESCE(p.max_age, 100)\n   AND (p.allowed_employment IS NULL OR u.employment_status = ANY (p.allowed_employment))\n WHERE u.batch_id = $1::uuid\n GROUP BY u.user_id;",
+        "options": {
+          "queryReplacement": "={{ $('Validate request').first().json.batch_id }}"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-15",
+      "name": "Evaluate and rank",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// Stages 3-4: apply compiled text rules, score, keep the top K products per user.\n//\n// Input: one item per user with the product_ids that passed the SQL hard rules.\n// No LLM calls happen here: each product's text rule was compiled once, so\n// checking it for a user is a few comparisons.\n\nconst TOP_K = 5;\nconst CHUNK_SIZE = 5000; // match rows per INSERT statement\n\nconst batchId = $('Validate request').first().json.batch_id;\nconst products = new Map($('Load products').all().map((i) => [i.json.product_id, i.json]));\nconst users = $input.all().map((i) => i.json).filter((u) => u.user_id);\n\n// True when the user meets every threshold in a compiled requirement.\nfunction meets(req, u) {\n  if (!req) return true;\n  if (req.credit_score_min != null && u.credit_score < req.credit_score_min) return false;\n  if (req.monthly_income_min != null && u.income < req.monthly_income_min) return false;\n  if (req.age_min != null && u.age < req.age_min) return false;\n  if (req.age_max != null && u.age > req.age_max) return false;\n  if (req.employment_in?.length && !req.employment_in.includes(u.employment_status)) return false;\n  return true;\n}\n\nfunction applyRule(rule, u) {\n  if (rule.kind === 'informational') return { pass: true, verify: [], note: null };\n  if (!meets(rule.require, u)) return { pass: false };\n  for (const c of rule.conditions ?? []) {\n    if (c.when_employment_in.includes(u.employment_status) && !meets(c.require, u)) {\n      return { pass: false };\n    }\n  }\n  const verify = rule.needs_unknown_data ?? [];\n  return { pass: true, verify, note: verify.length ? rule.verification_note || null : null };\n}\n\n// 0-100: headroom over the credit and income minimums, cheaper rates, and\n// certainty (no facts left to verify). Weights favour how safely the user qualifies.\nfunction score(u, p, verify) {\n  const credit = p.min_credit_score ? Math.min(1, (u.credit_score - p.min_credit_score) / 100) : 0.5;\n  const income = p.min_monthly_income ? Math.min(1, u.income / p.min_monthly_income - 1) : 0.5;\n  const rate = p.interest_rate_min != null\n    ? Math.max(0, Math.min(1, (36 - p.interest_rate_min) / 26))\n    : 0.5;\n  const certain = verify.length ? 0 : 1;\n  return Math.round((40 * credit + 30 * income + 20 * rate + 10 * certain) * 100) / 100;\n}\n\nconst stats = {\n  sql_candidates: 0,\n  hard_rule_only: 0,\n  text_rule_pairs: 0,\n  text_rule_rejected: 0,\n  unverified_pairs: 0,\n};\nconst rows = [];\n\nfor (const u of users) {\n  const kept = [];\n  for (const productId of u.product_ids) {\n    const p = products.get(productId);\n    if (!p) continue;\n    stats.sql_candidates++;\n\n    let stage;\n    let verify = [];\n    let note = null;\n    if (!p.extra_criteria_text) {\n      stage = 'HARD_RULES';\n      stats.hard_rule_only++;\n    } else {\n      stats.text_rule_pairs++;\n      const rule = p.compiled_current ? p.compiled_rules : null;\n      if (rule?.status === 'ok') {\n        const result = applyRule(rule, u);\n        if (!result.pass) {\n          stats.text_rule_rejected++;\n          continue;\n        }\n        stage = 'COMPILED_RULES';\n        verify = result.verify;\n        note = result.note;\n      } else {\n        // No usable compiled rule (LLM unavailable or output invalid): keep the\n        // match but say plainly that the extra conditions were not checked.\n        stage = 'UNVERIFIED';\n        stats.unverified_pairs++;\n        verify = ['text_rule_not_checked'];\n        note = `Additional conditions apply: ${p.extra_criteria_text}`;\n      }\n    }\n    kept.push({ product_id: productId, stage, verify, note, score: score(u, p, verify) });\n  }\n\n  kept.sort((a, b) => b.score - a.score);\n  for (const m of kept.slice(0, TOP_K)) {\n    rows.push({\n      user_id: u.user_id,\n      product_id: m.product_id,\n      match_stage: m.stage,\n      score: m.score,\n      needs_verification: m.verify,\n      match_note: m.note,\n    });\n  }\n}\n\nstats.after_top_k = rows.length;\nstats.matched_users = new Set(rows.map((r) => r.user_id)).size;\n\nconst sqlLiteral = (value) => `'${JSON.stringify(value).replace(/'/g, \"''\")}'`;\nconst chunks = [];\nfor (let i = 0; i < rows.length; i += CHUNK_SIZE) chunks.push(rows.slice(i, i + CHUNK_SIZE));\nif (chunks.length === 0) chunks.push([]); // keep the workflow moving when nothing matched\n\nreturn chunks.map((chunk, index) => ({\n  json: {\n    batch_id: batchId,\n    chunk: index + 1,\n    rows: chunk.length,\n    sql_payload: sqlLiteral(chunk),\n    ...(index === 0 ? { stats } : {}),\n  },\n}));\n"
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-16",
+      "name": "Insert matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3360,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=WITH data AS (\n  SELECT * FROM jsonb_to_recordset({{ $json.sql_payload }}::jsonb)\n    AS d(user_id text, product_id int, match_stage text, score numeric,\n         needs_verification text[], match_note text)\n), ins AS (\n  INSERT INTO matches (user_id, product_id, batch_id, match_stage, score, needs_verification, match_note)\n  SELECT user_id, product_id, '{{ $json.batch_id }}'::uuid, match_stage, score,\n         COALESCE(needs_verification, '{}'), match_note\n    FROM data\n  ON CONFLICT (user_id, product_id) DO UPDATE\n     SET batch_id = EXCLUDED.batch_id, match_stage = EXCLUDED.match_stage, score = EXCLUDED.score,\n         needs_verification = EXCLUDED.needs_verification, match_note = EXCLUDED.match_note\n   WHERE NOT matches.notified           -- never touch a match that was already emailed\n  RETURNING 1\n)\nSELECT count(*)::int AS inserted FROM ins;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-17",
+      "name": "Finish run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// Stage 5: assemble the funnel report for match_runs and the execution log.\n\nconst request = $('Validate request').first().json;\nconst start = $('Start run').first().json;\nconst stats = $('Evaluate and rank').first().json.stats;\nconst inserted = $input.all().reduce((sum, i) => sum + Number(i.json.inserted ?? 0), 0);\n\nlet rulesCompiled = 0;\nlet llmCalls = 0;\nlet llmError = null;\nconst compileRequest = $('Build compile request').first().json;\nif (compileRequest.count > 0) {\n  llmCalls = 1;\n  const parsed = $('Parse compiled rules').first().json;\n  rulesCompiled = parsed.saved ?? 0;\n  llmError = parsed.llm_ok ? null : parsed.error;\n}\n\nconst funnel = {\n  batch_id: request.batch_id,\n  users_in_batch: Number(start.users_in_batch),\n  active_products: Number(start.active_products),\n  raw_pairs: Number(start.users_in_batch) * Number(start.active_products),\n  sql_candidates: stats.sql_candidates,\n  hard_rule_only: stats.hard_rule_only,\n  text_rule_pairs: stats.text_rule_pairs,\n  text_rule_rejected: stats.text_rule_rejected,\n  unverified_pairs: stats.unverified_pairs,\n  after_top_k: stats.after_top_k,\n  matched_users: stats.matched_users,\n  rules_compiled: rulesCompiled,\n  llm_calls: llmCalls,\n  matches_inserted: inserted,\n  duration_ms: Date.now() - request.started_at,\n  llm_error: llmError,\n};\n\nreturn [{ json: funnel }];\n"
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-18",
+      "name": "Record run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3840,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=WITH run AS (\n  INSERT INTO match_runs (batch_id, users_in_batch, active_products, raw_pairs, sql_candidates,\n                          hard_rule_only, text_rule_pairs, text_rule_rejected, unverified_pairs,\n                          after_top_k, rules_compiled, llm_calls, matches_inserted, duration_ms)\n  VALUES ('{{ $json.batch_id }}'::uuid, {{ $json.users_in_batch }}, {{ $json.active_products }},\n          {{ $json.raw_pairs }}, {{ $json.sql_candidates }}, {{ $json.hard_rule_only }},\n          {{ $json.text_rule_pairs }}, {{ $json.text_rule_rejected }}, {{ $json.unverified_pairs }},\n          {{ $json.after_top_k }}, {{ $json.rules_compiled }}, {{ $json.llm_calls }},\n          {{ $json.matches_inserted }}, {{ $json.duration_ms }})\n  RETURNING run_id\n), upd AS (\n  UPDATE upload_batches SET status = 'MATCHED' WHERE batch_id = '{{ $json.batch_id }}'::uuid RETURNING 1\n)\nSELECT run_id FROM run;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnMatchingWflwB1-19",
+      "name": "Hand off to Workflow C",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        4080,
+        120
+      ],
+      "parameters": {},
+      "notes": "Replaced by an Execute Workflow call once Workflow C exists."
+    }
+  ],
+  "connections": {
+    "Webhook: batch ingested": {
+      "main": [
+        [
+          {
+            "node": "Validate request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate request": {
+      "main": [
+        [
+          {
+            "node": "Valid batch_id?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid batch_id?": {
+      "main": [
+        [
+          {
+            "node": "Respond 202 Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400 Bad Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 202 Accepted": {
+      "main": [
+        [
+          {
+            "node": "Start run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start run": {
+      "main": [
+        [
+          {
+            "node": "Load stale rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load stale rules": {
+      "main": [
+        [
+          {
+            "node": "Build compile request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build compile request": {
+      "main": [
+        [
+          {
+            "node": "Any rules to compile?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any rules to compile?": {
+      "main": [
+        [
+          {
+            "node": "Gemini: compile rules",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: compile rules": {
+      "main": [
+        [
+          {
+            "node": "Parse compiled rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse compiled rules": {
+      "main": [
+        [
+          {
+            "node": "Save compiled rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save compiled rules": {
+      "main": [
+        [
+          {
+            "node": "Load products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load products": {
+      "main": [
+        [
+          {
+            "node": "Load candidates (SQL pre-filter)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load candidates (SQL pre-filter)": {
+      "main": [
+        [
+          {
+            "node": "Evaluate and rank",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate and rank": {
+      "main": [
+        [
+          {
+            "node": "Insert matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert matches": {
+      "main": [
+        [
+          {
+            "node": "Finish run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finish run": {
+      "main": [
+        [
+          {
+            "node": "Record run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record run": {
+      "main": [
+        [
+          {
+            "node": "Hand off to Workflow C",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "active": false
+}

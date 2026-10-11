@@ -1,0 +1,2 @@
+# Packaged into the Lambda functions. boto3 is already in the Lambda runtime.
+psycopg2-binary==2.9.10
