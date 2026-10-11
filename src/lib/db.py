@@ -1,19 +1,22 @@
 """PostgreSQL connection helpers.
 
-The connection is cached at module level so warm Lambda invocations reuse it
-instead of paying the TLS + auth handshake on every event.
+The connection is cached so warm Lambda invocations reuse it instead of paying
+the TLS + auth handshake on every event. The cache is per thread: Lambda runs
+one thread per container, and the local dev server (scripts/dev_server.py)
+ingests in one thread while serving status polls in others.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 from contextlib import contextmanager
 from typing import Iterator
 
 import psycopg2
 import psycopg2.extensions
 
-_conn: psycopg2.extensions.connection | None = None
+_local = threading.local()
 
 
 def _connect() -> psycopg2.extensions.connection:
@@ -31,18 +34,19 @@ def _connect() -> psycopg2.extensions.connection:
 
 
 def get_connection() -> psycopg2.extensions.connection:
-    """Return a live connection, reconnecting if the cached one was dropped."""
-    global _conn
-    if _conn is None or _conn.closed:
-        _conn = _connect()
+    """Return this thread's live connection, reconnecting if it was dropped."""
+    conn: psycopg2.extensions.connection | None = getattr(_local, "conn", None)
+    if conn is None or conn.closed:
+        conn = _connect()
     else:
         try:
-            with _conn.cursor() as cur:
+            with conn.cursor() as cur:
                 cur.execute("SELECT 1")
-            _conn.rollback()
+            conn.rollback()
         except psycopg2.Error:
-            _conn = _connect()
-    return _conn
+            conn = _connect()
+    _local.conn = conn
+    return conn
 
 
 @contextmanager

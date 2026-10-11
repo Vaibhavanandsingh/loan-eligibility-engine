@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loan Eligibility Engine · Upload</title>
+<style>
+  /* Layout: one centred card; the pipeline steps read top to bottom in the order the data moves. */
+  :root {
+    --bg: #F4F6F8; --card: #FFFFFF; --ink: #17202E; --muted: #5C6678; --line: #D9DEE6;
+    --accent: #B45309; --accent-soft: #FDF0E1; --ok: #15803D; --ok-soft: #E7F6EC;
+    --bad: #B42318; --bad-soft: #FDECEA; --warn: #A15C00;
+    --font: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0F141C; --card: #18202C; --ink: #E6EAF0; --muted: #9AA4B4; --line: #2C3646;
+      --accent: #F59E0B; --accent-soft: #3A2A12; --ok: #4ADE80; --ok-soft: #13301E;
+      --bad: #F87171; --bad-soft: #3A1717; --warn: #FBBF24; color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--font); }
+  main { max-width: 620px; margin: 0 auto; padding: 48px 16px 64px; }
+  h1 { font-size: 26px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 6px 0 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 22px; }
+
+  .drop { border: 2px dashed var(--line); border-radius: 10px; padding: 28px 16px; text-align: center;
+          cursor: pointer; transition: border-color .15s, background .15s; }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .drop strong { display: block; font-size: 16px; }
+  .drop span { color: var(--muted); font-size: 13px; }
+  .file { display: flex; justify-content: space-between; gap: 12px; margin-top: 14px; font-size: 14px; }
+  .file .name { font-weight: 600; overflow-wrap: anywhere; }
+  .file .meta { color: var(--muted); white-space: nowrap; }
+
+  button { margin-top: 16px; width: 100%; padding: 11px; border: 0; border-radius: 8px; font: 600 15px var(--font);
+           background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  ol.steps { list-style: none; margin: 22px 0 0; padding: 0; display: grid; gap: 14px; }
+  .step { display: grid; grid-template-columns: 28px 1fr; gap: 12px; align-items: start; }
+  .dot { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; font: 600 13px var(--mono);
+         border: 2px solid var(--line); color: var(--muted); background: var(--card); }
+  .step.active .dot { border-color: var(--accent); color: var(--accent); }
+  .step.done .dot { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+  .step.failed .dot { border-color: var(--bad); background: var(--bad-soft); color: var(--bad); }
+  .step.warn .dot { border-color: var(--warn); color: var(--warn); }
+  .step h3 { margin: 3px 0 0; font-size: 15px; }
+  .step p { margin: 2px 0 0; color: var(--muted); font-size: 13.5px; font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+
+  .batch { margin-top: 18px; font-size: 12.5px; color: var(--muted); }
+  .batch code { font-family: var(--mono); color: var(--ink); overflow-wrap: anywhere; }
+  .error { margin-top: 16px; padding: 10px 12px; border-radius: 8px; background: var(--bad-soft); color: var(--bad); font-size: 14px; }
+  footer { margin-top: 18px; color: var(--muted); font-size: 12.5px; }
+  footer code { font-family: var(--mono); }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Loan Eligibility Engine</h1>
+  <p class="sub">Upload a CSV of users. Each user is checked against current loan products and matched users are notified.</p>
+
+  <div class="card">
+    <div class="drop" id="drop" tabindex="0" role="button" aria-describedby="drop-hint">
+      <strong>Drop users.csv here or click to choose</strong>
+      <span id="drop-hint">Columns: user_id, email, monthly_income, credit_score, employment_status, age (name optional)</span>
+    </div>
+    <input type="file" id="file" accept=".csv,text/csv" hidden>
+    <div class="file" id="file-info" hidden>
+      <span class="name" id="file-name"></span>
+      <span class="meta" id="file-meta"></span>
+    </div>
+    <button id="upload" disabled>Upload and start</button>
+
+    <ol class="steps" id="steps" hidden>
+      <li class="step" data-step="upload">
+        <div class="dot">1</div>
+        <div><h3>Upload to storage</h3><p data-detail>Waiting</p><div class="bar"><div data-bar></div></div></div>
+      </li>
+      <li class="step" data-step="ingest">
+        <div class="dot">2</div>
+        <div><h3>Check and save rows</h3><p data-detail>Waiting</p></div>
+      </li>
+      <li class="step" data-step="match">
+        <div class="dot">3</div>
+        <div><h3>Match users to loans</h3><p data-detail>Waiting</p></div>
+      </li>
+      <li class="step" data-step="notify">
+        <div class="dot">4</div>
+        <div><h3>Email matched users</h3><p data-detail>Waiting</p></div>
+      </li>
+    </ol>
+
+    <div class="error" id="error" role="alert" hidden></div>
+    <p class="batch" id="batch" hidden>Batch <code id="batch-id"></code></p>
+  </div>
+
+  <footer>API: <code id="api-label"></code></footer>
+</main>
+
+<script>
+// The page talks to three endpoints:
+//   GET  {API}/upload-url?filename=...  -> { batch_id, upload_url, headers }
+//   PUT  upload_url (straight to S3; the file never passes through the API)
+//   GET  {API}/status/{batch_id}        -> progress, polled every 2 s
+// Set the API with ?api=https://xxxx.execute-api.ap-south-1.amazonaws.com
+// Without it, the page uses the server it was loaded from (scripts/dev_server.py).
+const API = (new URLSearchParams(location.search).get('api') || '').replace(/\/$/, '');
+const POLL_MS = 2000;
+const POLL_LIMIT_MS = 15 * 60 * 1000;
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => Number(n || 0).toLocaleString('en-IN');
+let file = null;
+
+$('api-label').textContent = API || `${location.origin} (this server)`;
+
+function step(name) {
+  const el = document.querySelector(`[data-step="${name}"]`);
+  return {
+    set(state, detail) {
+      el.classList.remove('active', 'done', 'failed', 'warn');
+      if (state) el.classList.add(state);
+      if (detail !== undefined) el.querySelector('[data-detail]').textContent = detail;
+    },
+    bar(pct) { const b = el.querySelector('[data-bar]'); if (b) b.style.width = `${pct}%`; },
+  };
+}
+
+function showError(message) {
+  $('error').textContent = message;
+  $('error').hidden = false;
+}
+
+function choose(f) {
+  if (!f) return;
+  if (!/\.csv$/i.test(f.name)) { showError('Please choose a .csv file.'); return; }
+  file = f;
+  $('error').hidden = true;
+  $('file-name').textContent = f.name;
+  $('file-meta').textContent = `${(f.size / 1024 / 1024).toFixed(2)} MB`;
+  $('file-info').hidden = false;
+  $('upload').disabled = false;
+}
+
+const drop = $('drop');
+drop.addEventListener('click', () => $('file').click());
+drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('file').click(); } });
+$('file').addEventListener('change', (e) => choose(e.target.files[0]));
+['dragenter', 'dragover'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', (e) => choose(e.dataTransfer.files[0]));
+
+async function getJson(url) {
+  const res = await fetch(url);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `Request failed (HTTP ${res.status})`);
+  return body;
+}
+
+// XMLHttpRequest rather than fetch, because it reports upload progress.
+function putFile(url, headers, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    Object.entries(headers || {}).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300
+      ? resolve()
+      : reject(new Error(`Storage rejected the upload (HTTP ${xhr.status}). The link may have expired; try again.`)));
+    xhr.onerror = () => reject(new Error('Upload failed: could not reach storage. Check your connection and try again.'));
+    xhr.send(file);
+  });
+}
+
+// Map the batch status to the four steps on screen. Returns true when finished.
+function render(s) {
+  const ingest = step('ingest'), match = step('match'), notify = step('notify');
+  const rows = `${fmt(s.valid_rows)} saved` + (s.invalid_rows ? `, ${fmt(s.invalid_rows)} rejected` : '');
+  const matched = `${fmt(s.matches)} matches for ${fmt(s.matched_users)} users`;
+
+  switch (s.status) {
+    case 'PENDING_UPLOAD':
+      ingest.set('active', 'Waiting for the file to arrive');
+      return false;
+    case 'PROCESSING':
+      ingest.set('active', `${fmt(s.total_rows)} rows read · ${rows}`);
+      return false;
+    case 'COMPLETED':
+      ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
+      match.set('active', s.valid_rows ? 'Starting matching' : 'No valid rows to match');
+      return !s.valid_rows;
+    case 'WEBHOOK_PENDING':
+      ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
+      match.set('warn', 'Rows are saved, but the matching service could not be reached. It can be retried.');
+      return true;
+    case 'MATCHING':
+      ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
+      match.set('active', 'Checking every user against current loan products');
+      return false;
+    case 'MATCHED':
+      ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
+      match.set('done', matched);
+      notify.set(s.notified_matches ? 'active' : '', s.notified_matches
+        ? `${fmt(s.notified_matches)} matches emailed so far` : 'Waiting for the notification workflow');
+      return false;
+    case 'NOTIFIED':
+      ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
+      match.set('done', matched);
+      notify.set('done', `${fmt(s.notified_matches)} matches emailed`);
+      return true;
+    case 'FAILED':
+      ingest.set('failed', s.error_message || 'Processing failed');
+      showError(`This upload failed: ${s.error_message || 'unknown error'}. Fix the file and upload it again.`);
+      return true;
+    default:
+      return false;
+  }
+}
+
+async function poll(batchId) {
+  const started = Date.now();
+  while (Date.now() - started < POLL_LIMIT_MS) {
+    try {
+      if (render(await getJson(`${API}/status/${batchId}`))) return;
+    } catch (e) {
+      // A missed poll is not fatal; keep trying.
+    }
+    await new Promise((r) => setTimeout(r, POLL_MS));
+  }
+  showError('Still running after 15 minutes. Use the batch id below to check its status later.');
+}
+
+$('upload').addEventListener('click', async () => {
+  if (!file) return;
+  $('upload').disabled = true;
+  $('error').hidden = true;
+  $('steps').hidden = false;
+  ['upload', 'ingest', 'match', 'notify'].forEach((n) => step(n).set('', 'Waiting'));
+  const upload = step('upload');
+
+  try {
+    upload.set('active', 'Requesting an upload link');
+    const link = await getJson(`${API}/upload-url?filename=${encodeURIComponent(file.name)}`);
+    $('batch-id').textContent = link.batch_id;
+    $('batch').hidden = false;
+
+    await putFile(link.upload_url, link.headers, (pct) => { upload.bar(pct); upload.set('active', `Uploading · ${pct}%`); });
+    upload.bar(100);
+    upload.set('done', `${file.name} uploaded`);
+    await poll(link.batch_id);
+  } catch (e) {
+    upload.set('failed', e.message);
+    showError(e.message);
+  } finally {
+    $('upload').disabled = false;
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,210 @@
+# AWS stack for CSV ingestion: HTTP API + Lambdas, S3 upload bucket, RDS
+# PostgreSQL, a dead-letter queue, and a send-only IAM user for n8n's SES node.
+#
+#   npm install
+#   npx serverless deploy                  # stage "dev", region ap-south-1
+#   npx serverless info                    # prints the API URL and outputs
+#   npx serverless remove                  # tears everything down
+#
+# Values come from .env (useDotenv). Required for deploy: RDS_MASTER_PASSWORD,
+# N8N_WEBHOOK_SECRET. N8N_WEBHOOK_URL is the public tunnel URL of n8n.
+
+service: loan-eligibility-engine
+frameworkVersion: '3'
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: x86_64
+  region: ${opt:region, 'ap-south-1'}
+  stage: ${opt:stage, 'dev'}
+  profile: ${env:AWS_PROFILE, 'clickpe'}
+  memorySize: 256
+  timeout: 15
+  logRetentionInDays: 14
+  environment:
+    DB_HOST: !GetAtt Database.Endpoint.Address
+    DB_PORT: '5432'
+    DB_NAME: loans
+    DB_USER: loans
+    # Plain env var keeps the demo simple; production would read it from
+    # Secrets Manager at runtime instead.
+    DB_PASSWORD: ${env:RDS_MASTER_PASSWORD}
+    DB_SSLMODE: require
+    UPLOAD_BUCKET: ${self:custom.uploadBucket}
+    UPLOAD_URL_TTL: '300'
+    N8N_WEBHOOK_URL: ${env:N8N_WEBHOOK_URL, ''}
+    N8N_WEBHOOK_SECRET: ${env:N8N_WEBHOOK_SECRET}
+    LOG_LEVEL: INFO
+  httpApi:
+    cors:
+      allowedOrigins: ${self:custom.uiOrigins}
+      allowedMethods: [GET]
+      allowedHeaders: [Content-Type]
+  iam:
+    role:
+      statements:
+        # process_csv reads uploads; get_upload_url signs PUTs, which needs PutObject.
+        - Effect: Allow
+          Action: [s3:GetObject, s3:PutObject]
+          Resource: arn:aws:s3:::${self:custom.uploadBucket}/uploads/*
+        - Effect: Allow
+          Action: [s3:PutObject]
+          Resource: arn:aws:s3:::${self:custom.uploadBucket}/rejected/*
+        - Effect: Allow
+          Action: [sqs:SendMessage]
+          Resource: !GetAtt IngestDeadLetterQueue.Arn
+  # Bucket defined here (not in resources) so the S3 event below can attach to it.
+  s3:
+    uploads:
+      name: ${self:custom.uploadBucket}
+      publicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      bucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      # Browsers PUT straight to S3 with the presigned URL, so S3 needs CORS.
+      corsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: ${self:custom.uiOrigins}
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      # Raw uploads are only needed until ingested.
+      lifecycleConfiguration:
+        Rules:
+          - Id: expire-raw-uploads
+            Status: Enabled
+            ExpirationInDays: 7
+
+custom:
+  # Bucket names are global, so include the account id.
+  uploadBucket: ${self:service}-uploads-${sls:stage}-${aws:accountId}
+  # Where the upload page is served from. '*' allows opening ui/index.html locally.
+  uiOrigins:
+    - ${env:UI_ORIGIN, '*'}
+  # Who may reach Postgres on 5432. See README "Networking" for why RDS is public.
+  dbAllowedCidr: ${env:DB_ALLOWED_CIDR, '0.0.0.0/0'}
+  pythonRequirements:
+    fileName: requirements.txt
+    slim: true
+    # Fetch Linux wheels for Lambda directly, so packaging needs no Docker. Any
+    # local Python 3 works: --python-version picks the Lambda runtime's wheels.
+    dockerizePip: false
+    pythonBin: ${env:PYTHON_BIN, 'python3'}
+    pipCmdExtraArgs:
+      - --platform manylinux2014_x86_64
+      - '--only-binary=:all:'
+      - --python-version 3.12
+
+package:
+  patterns:
+    - '!**'
+    - 'src/**'
+    - '!src/**/__pycache__/**'
+
+functions:
+  getUploadUrl:
+    handler: src/handlers/get_upload_url.handler
+    description: Issues a presigned S3 PUT URL and creates the batch row
+    events:
+      - httpApi: { path: /upload-url, method: GET }
+
+  getStatus:
+    handler: src/handlers/get_status.handler
+    description: Batch progress for the upload page
+    events:
+      - httpApi: { path: '/status/{batch_id}', method: GET }
+
+  processCsv:
+    handler: src/handlers/process_csv.handler
+    description: Streams an uploaded CSV into RDS and triggers n8n matching
+    timeout: 900          # Lambda maximum; 10k rows take under a second
+    memorySize: 1024
+    maximumRetryAttempts: 2
+    destinations:
+      onFailure:
+        type: sqs
+        arn: !GetAtt IngestDeadLetterQueue.Arn
+    events:
+      - s3:
+          bucket: uploads
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: uploads/
+            - suffix: .csv
+
+resources:
+  Resources:
+    # Failed S3 events land here after retries, instead of disappearing.
+    IngestDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        MessageRetentionPeriod: 1209600   # 14 days
+
+    DatabaseSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Postgres access for the loan engine
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: ${self:custom.dbAllowedCidr}
+
+    DatabaseParameterGroup:
+      Type: AWS::RDS::DBParameterGroup
+      Properties:
+        Family: postgres16
+        Description: Require TLS for every connection
+        Parameters:
+          rds.force_ssl: '1'
+
+    Database:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete            # demo stack; use Snapshot for real data
+      Properties:
+        Engine: postgres
+        EngineVersion: '16'
+        DBInstanceClass: db.t4g.micro
+        AllocatedStorage: '20'
+        StorageType: gp3
+        StorageEncrypted: true
+        DBName: loans
+        MasterUsername: loans
+        MasterUserPassword: ${env:RDS_MASTER_PASSWORD}
+        DBParameterGroupName: !Ref DatabaseParameterGroup
+        VPCSecurityGroups: [!GetAtt DatabaseSecurityGroup.GroupId]
+        PubliclyAccessible: true
+        BackupRetentionPeriod: 1
+
+    # n8n's AWS SES node signs in as this user. It can send email and nothing else.
+    N8nSesUser:
+      Type: AWS::IAM::User
+      Properties:
+        Policies:
+          - PolicyName: ses-send-only
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [ses:SendEmail, ses:SendRawEmail]
+                  Resource: '*'
+
+  Outputs:
+    UploadBucketName:
+      Value: ${self:custom.uploadBucket}
+    DatabaseEndpoint:
+      Value: !GetAtt Database.Endpoint.Address
+    DeadLetterQueueUrl:
+      Value: !Ref IngestDeadLetterQueue
+    N8nSesUserName:
+      Description: Create its access key with `aws iam create-access-key --user-name <this>`
+      Value: !Ref N8nSesUser
+
+plugins:
+  - serverless-python-requirements
