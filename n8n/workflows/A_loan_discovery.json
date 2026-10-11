@@ -1,0 +1,481 @@
+{
+  "id": "lnDiscoveryWflA1",
+  "name": "A - Loan Product Discovery",
+  "nodes": [
+    {
+      "id": "lnDiscoveryWflA1-01",
+      "name": "Daily at 02:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        120
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-02",
+      "name": "Webhook: crawl now",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        480
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "crawl-now",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "webhookId": "9e4d2c1a-7b3f-4a8e-b6d5-3c2a1f0e9d84",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "lnWebhookSecret1",
+          "name": "Webhook secret (Lambda to n8n)"
+        }
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-03",
+      "name": "Load sources",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT source_site, url, content_hash AS previous_hash\n  FROM crawl_sources\n WHERE enabled\n ORDER BY source_site;",
+        "options": {}
+      },
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-04",
+      "name": "Fetch page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "LoanEligibilityEngineBot/0.1 (student assignment; polite, once per day)"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "html"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "lnDiscoveryWflA1-05",
+      "name": "Clean to loan text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Turn each fetched HTML page into compact, loan-relevant plain text.\n//\n// Why: a bank page can be 1 MB of HTML but only a few KB of loan terms, and the\n// LLM charges by the amount of text it reads. Keeping only lines that talk about\n// rates, income, age, credit score and so on also makes the hash steadier:\n// rotating banners and footers no longer count as a \"changed page\".\n\nconst MAX_CHARS = 40000;\nconst MIN_USEFUL_CHARS = 500;\n\nconst RELEVANT = /(eligib|income|salar|\\bage\\b|years|cibil|credit score|interest|rate|%|\u20b9|\\brs\\.?|lakh|crore|loan amount|tenure|employ|self[- ]employed|business|turnover|vintage|itr|minimum|maximum)/i;\n\nconst ENTITIES = {\n  '&nbsp;': ' ', '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '\"', '&#39;': \"'\",\n  '&rsquo;': \"'\", '&lsquo;': \"'\", '&rdquo;': '\"', '&ldquo;': '\"', '&ndash;': '-', '&mdash;': '-',\n  '&#8377;': '\u20b9', '&#x20b9;': '\u20b9', '&rupee;': '\u20b9',\n};\n\nfunction htmlToLines(html) {\n  const text = html\n    .replace(/<(script|style|noscript|svg|head|iframe)[\\s\\S]*?<\\/\\1>/gi, ' ')\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    .replace(/<(br|\\/p|\\/li|\\/tr|\\/h[1-6]|\\/div|\\/section|\\/table|\\/ul|\\/ol)\\b[^>]*>/gi, '\\n')\n    .replace(/<(td|th)\\b[^>]*>/gi, ' | ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&[#a-z0-9]+;/gi, (e) => ENTITIES[e.toLowerCase()]\n      ?? (/^&#\\d+;$/.test(e) ? String.fromCharCode(Number(e.slice(2, -1))) : ' '));\n  return text.split('\\n').map((l) => l.replace(/\\s+/g, ' ').replace(/^[\\s|]+|[\\s|]+$/g, '').trim()).filter(Boolean);\n}\n\n// Keep relevant lines plus the line before each (usually the lender or section heading).\nfunction relevantText(lines) {\n  const keep = new Set();\n  lines.forEach((line, i) => {\n    if (RELEVANT.test(line) && line.length < 1000) {\n      if (i > 0 && lines[i - 1].length < 120) keep.add(i - 1);\n      keep.add(i);\n    }\n  });\n  const out = [];\n  for (const i of [...keep].sort((a, b) => a - b)) {\n    if (out[out.length - 1] !== lines[i]) out.push(lines[i]); // drop repeated lines\n  }\n  return out.join('\\n').slice(0, MAX_CHARS);\n}\n\nconst sources = $('Load sources').all().map((i) => i.json);\n\nreturn $input.all().map((item, index) => {\n  const source = sources[item.pairedItem?.item ?? index];\n  const html = typeof item.json.html === 'string' ? item.json.html : '';\n  const fetchError = item.json.error ? String(item.json.error.message ?? item.json.error).slice(0, 300) : null;\n  const text = html ? relevantText(htmlToLines(html)) : '';\n  return {\n    json: {\n      source_site: source.source_site,\n      url: source.url,\n      previous_hash: source.previous_hash,\n      fetch_ok: !fetchError && html.length > 0,\n      fetch_error: fetchError,\n      html_kb: Math.round(html.length / 1024),\n      chars: text.length,\n      useful: text.length >= MIN_USEFUL_CHARS,\n      text,\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-06",
+      "name": "SHA-256 of text",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "action": "hash",
+        "type": "SHA256",
+        "value": "={{ $json.text }}",
+        "dataPropertyName": "text_hash"
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-07",
+      "name": "Changed since last extraction?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Changed since last extraction?-cond",
+              "leftValue": "={{ $json.fetch_ok && $json.useful && $json.text_hash !== $json.previous_hash }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-08",
+      "name": "Build extract request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// One Gemini request per changed page: extract its loan products as JSON.\n\nconst MODEL = 'gemini-2.5-flash';\nconst EMPLOYMENT = ['salaried', 'self_employed', 'business'];\n\nconst num = (type = 'NUMBER') => ({ type, nullable: true });\nconst responseSchema = {\n  type: 'ARRAY',\n  items: {\n    type: 'OBJECT',\n    properties: {\n      product_name: { type: 'STRING' },\n      provider: { type: 'STRING' },\n      interest_rate_min: num(),\n      interest_rate_max: num(),\n      loan_amount_min: num(),\n      loan_amount_max: num(),\n      min_monthly_income: num(),\n      min_credit_score: num('INTEGER'),\n      max_credit_score: num('INTEGER'),\n      min_age: num('INTEGER'),\n      max_age: num('INTEGER'),\n      allowed_employment: { type: 'ARRAY', items: { type: 'STRING', enum: EMPLOYMENT }, nullable: true },\n      extra_criteria_text: { type: 'STRING', nullable: true },\n    },\n    required: ['product_name', 'provider'],\n  },\n};\n\nfunction instructions(page) {\n  return `You extract loan products from the text of an Indian financial web page (a bank or a loan comparison site).\n\nReturn one object per distinct personal or business loan product whose terms the page states:\n- product_name: lender plus product, e.g. \"Yes Bank Personal Loan\".\n- provider: the lender's name.\n- interest_rate_min / interest_rate_max: percent per year.\n- loan_amount_min / loan_amount_max, min_monthly_income: INR. Convert \"\u20b915,000\" to 15000, \"1 lakh\" to 100000, \"40L\" to 4000000, \"1 crore\" to 10000000.\n- min_credit_score / max_credit_score: CIBIL-style 300-900.\n- min_age / max_age: years.\n- allowed_employment: subset of salaried, self_employed, business; null if the page does not say.\n- extra_criteria_text: eligibility rules the fields above cannot hold, as short plain sentences; null if none.\n\nRules:\n- Use only values the page states for that specific product. Do not copy general advice that the page gives about loans in general onto a lender.\n- When a rule differs by group (e.g. salaried age 21-60, self-employed 21-65), put the most permissive value in the field (min_age 21, max_age 65) and state the group-specific limits in extra_criteria_text (\"Salaried applicants: maximum age 60.\").\n- Rules about city, employer type, work experience, years in business, turnover or tax returns go in extra_criteria_text.\n- Skip a product if the page gives no eligibility terms for it at all (no income, credit score, age or employment rule).\n- Return at most 30 products. Return [] if there are none.\n\nPage: ${page.source_site} (${page.url})\n---\n${page.text}`;\n}\n\nreturn $input.all().map(({ json: page }) => ({\n  json: {\n    source_site: page.source_site,\n    url: page.url,\n    text_hash: page.text_hash,\n    model: MODEL,\n    request_body: {\n      contents: [{ role: 'user', parts: [{ text: instructions(page) }] }],\n      generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema },\n    },\n  },\n}));\n"
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-09",
+      "name": "Gemini: extract products",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $json.model }}:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request_body) }}",
+        "options": {
+          "timeout": 180000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 4000
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 10000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "lnGeminiApiKey01",
+          "name": "Gemini API key"
+        }
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-10",
+      "name": "Validate products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// Validate and normalise the products Gemini extracted from each page.\n//\n// Out-of-range numbers are dropped (set to null), min/max pairs are put in\n// order, and a product with no eligibility terms at all is discarded: with no\n// rules it would match every user, which would be misleading. If nothing valid\n// comes back for a page, the page is marked extract_failed and its stored hash\n// is not updated, so the next run tries again.\n\nconst EMPLOYMENT = new Set(['salaried', 'self_employed', 'business']);\nconst RANGES = {\n  interest_rate_min: [1, 60], interest_rate_max: [1, 60],\n  loan_amount_min: [1000, 1e9], loan_amount_max: [1000, 1e9],\n  min_monthly_income: [1000, 1e7],\n  min_credit_score: [300, 900], max_credit_score: [300, 900],\n  min_age: [18, 100], max_age: [18, 100],\n};\nconst MAX_PRODUCTS = 30;\n\nconst sqlText = (value) => (value == null ? 'NULL' : `'${String(value).replace(/'/g, \"''\")}'`);\nconst sqlJson = (value) => `'${JSON.stringify(value).replace(/'/g, \"''\")}'`;\n\nfunction inRange(value, [lo, hi]) {\n  return typeof value === 'number' && Number.isFinite(value) && value >= lo && value <= hi ? value : null;\n}\n\nfunction ordered(p, lo, hi) {\n  if (p[lo] != null && p[hi] != null && p[lo] > p[hi]) [p[lo], p[hi]] = [p[hi], p[lo]];\n}\n\nfunction clean(raw) {\n  const name = String(raw.product_name ?? '').replace(/\\s+/g, ' ').trim();\n  if (name.length < 3 || name.length > 150) return null;\n  const p = { product_name: name, provider: String(raw.provider ?? '').trim().slice(0, 100) || null };\n  for (const [field, range] of Object.entries(RANGES)) p[field] = inRange(raw[field], range);\n  ordered(p, 'interest_rate_min', 'interest_rate_max');\n  ordered(p, 'loan_amount_min', 'loan_amount_max');\n  ordered(p, 'min_credit_score', 'max_credit_score');\n  ordered(p, 'min_age', 'max_age');\n  const employment = Array.isArray(raw.allowed_employment)\n    ? [...new Set(raw.allowed_employment.filter((e) => EMPLOYMENT.has(e)))]\n    : [];\n  p.allowed_employment = employment.length ? employment : null;\n  const extra = String(raw.extra_criteria_text ?? '').trim();\n  p.extra_criteria_text = extra ? extra.slice(0, 600) : null;\n\n  const hasEligibility = p.min_monthly_income != null || p.min_credit_score != null\n    || p.min_age != null || p.max_age != null || p.allowed_employment != null || p.extra_criteria_text != null;\n  return hasEligibility ? p : null;\n}\n\nconst requests = $('Build extract request').all().map((i) => i.json);\n\nreturn $input.all().map((item, index) => {\n  const req = requests[item.pairedItem?.item ?? index];\n  const response = item.json;\n  let products = [];\n  let error = null;\n\n  const text = response?.candidates?.[0]?.content?.parts?.[0]?.text;\n  if (!text) {\n    error = String(response?.error?.message ?? response?.error ?? 'no candidates in response').slice(0, 300);\n  } else {\n    try {\n      const parsed = JSON.parse(text);\n      if (!Array.isArray(parsed)) throw new Error('response is not an array');\n      const seen = new Set();\n      for (const raw of parsed) {\n        const p = clean(raw ?? {});\n        if (!p || seen.has(p.product_name.toLowerCase())) continue;\n        seen.add(p.product_name.toLowerCase());\n        products.push(p);\n      }\n      products = products.slice(0, MAX_PRODUCTS);\n      if (products.length === 0) error = 'no valid products extracted';\n    } catch (e) {\n      error = `unparseable LLM output: ${e.message}`;\n    }\n  }\n\n  const ok = products.length > 0;\n  return {\n    json: {\n      source_site: req.source_site,\n      ok,\n      product_count: products.length,\n      error,\n      products_sql: sqlJson(products),\n      q_site: sqlText(req.source_site),\n      q_url: sqlText(req.url),\n      q_hash: sqlText(req.text_hash),\n      q_status: sqlText(ok ? 'extracted' : 'extract_failed'),\n      q_error: sqlText(error),\n      q_ok: ok ? 'TRUE' : 'FALSE',\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-11",
+      "name": "Save products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2160,
+        120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=WITH data AS (\n  SELECT * FROM jsonb_to_recordset({{ $json.products_sql }}::jsonb) AS d(\n    product_name text, provider text, interest_rate_min numeric, interest_rate_max numeric,\n    loan_amount_min numeric, loan_amount_max numeric, min_monthly_income numeric,\n    min_credit_score int, max_credit_score int, min_age int, max_age int,\n    allowed_employment text[], extra_criteria_text text)\n), up AS (\n  INSERT INTO loan_products (source_site, product_name, provider, interest_rate_min, interest_rate_max,\n                             loan_amount_min, loan_amount_max, min_monthly_income, min_credit_score,\n                             max_credit_score, min_age, max_age, allowed_employment,\n                             extra_criteria_text, source_url, content_hash, last_seen_at, is_active)\n  SELECT {{ $json.q_site }}, product_name, provider, interest_rate_min, interest_rate_max,\n         loan_amount_min, loan_amount_max, min_monthly_income, min_credit_score, max_credit_score,\n         min_age, max_age, allowed_employment, extra_criteria_text,\n         {{ $json.q_url }}, {{ $json.q_hash }}, now(), TRUE\n    FROM data\n  ON CONFLICT (source_site, product_name) DO UPDATE SET\n    provider = EXCLUDED.provider, interest_rate_min = EXCLUDED.interest_rate_min,\n    interest_rate_max = EXCLUDED.interest_rate_max, loan_amount_min = EXCLUDED.loan_amount_min,\n    loan_amount_max = EXCLUDED.loan_amount_max, min_monthly_income = EXCLUDED.min_monthly_income,\n    min_credit_score = EXCLUDED.min_credit_score, max_credit_score = EXCLUDED.max_credit_score,\n    min_age = EXCLUDED.min_age, max_age = EXCLUDED.max_age,\n    allowed_employment = EXCLUDED.allowed_employment, extra_criteria_text = EXCLUDED.extra_criteria_text,\n    source_url = EXCLUDED.source_url, content_hash = EXCLUDED.content_hash,\n    last_seen_at = now(), is_active = TRUE\n  RETURNING product_id\n), retired AS (\n  UPDATE loan_products SET is_active = FALSE\n   WHERE source_site = {{ $json.q_site }} AND is_active AND {{ $json.q_ok }}\n     AND product_id NOT IN (SELECT product_id FROM up)\n  RETURNING 1\n), src AS (\n  UPDATE crawl_sources\n     SET last_crawled_at = now(), last_status = {{ $json.q_status }}, last_error = {{ $json.q_error }},\n         last_product_count = (SELECT count(*) FROM up),\n         content_hash = CASE WHEN {{ $json.q_ok }} THEN {{ $json.q_hash }} ELSE content_hash END\n   WHERE source_site = {{ $json.q_site }}\n  RETURNING 1\n)\nSELECT {{ $json.q_site }} AS source_site, {{ $json.q_status }} AS status,\n       (SELECT count(*) FROM up)::int AS upserted, (SELECT count(*) FROM retired)::int AS retired,\n       (SELECT count(*) FROM src)::int AS source_updated;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-12",
+      "name": "Mark skipped pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        480
+      ],
+      "parameters": {
+        "jsCode": "// Pages that did not go to the LLM: unchanged since the last extraction, failed\n// to fetch, or had no usable text. Only status fields are updated; the stored\n// hash is left alone, so a failed page is retried on the next run.\n\nconst sqlText = (value) => (value == null ? 'NULL' : `'${String(value).replace(/'/g, \"''\")}'`);\n\nreturn $input.all().map(({ json: s }) => {\n  let status = 'unchanged';\n  let error = null;\n  if (!s.fetch_ok) {\n    status = 'fetch_failed';\n    error = s.fetch_error;\n  } else if (!s.useful) {\n    status = 'no_content';\n    error = `only ${s.chars} characters of loan-related text`;\n  }\n  return {\n    json: {\n      source_site: s.source_site,\n      status,\n      q_site: sqlText(s.source_site),\n      q_status: sqlText(status),\n      q_error: sqlText(error),\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-13",
+      "name": "Record skip",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1680,
+        480
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE crawl_sources\n    SET last_crawled_at = now(), last_status = {{ $json.q_status }}, last_error = {{ $json.q_error }}\n  WHERE source_site = {{ $json.q_site }}\nRETURNING source_site, last_status;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    },
+    {
+      "id": "lnDiscoveryWflA1-14",
+      "name": "Seed fallback",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2400,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH crawled AS (\n  SELECT count(*) AS n FROM loan_products WHERE source_site <> 'seed' AND is_active\n), upd AS (\n  UPDATE loan_products SET is_active = ((SELECT n FROM crawled) < 5)\n   WHERE source_site = 'seed'\n  RETURNING is_active\n)\nSELECT (SELECT n FROM crawled)::int AS crawled_active_products,\n       COALESCE(bool_or(is_active), FALSE) AS seed_products_active\n  FROM upd;",
+        "options": {}
+      },
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App Db(local)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily at 02:00": {
+      "main": [
+        [
+          {
+            "node": "Load sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: crawl now": {
+      "main": [
+        [
+          {
+            "node": "Load sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load sources": {
+      "main": [
+        [
+          {
+            "node": "Fetch page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch page": {
+      "main": [
+        [
+          {
+            "node": "Clean to loan text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean to loan text": {
+      "main": [
+        [
+          {
+            "node": "SHA-256 of text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SHA-256 of text": {
+      "main": [
+        [
+          {
+            "node": "Changed since last extraction?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Changed since last extraction?": {
+      "main": [
+        [
+          {
+            "node": "Build extract request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark skipped pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build extract request": {
+      "main": [
+        [
+          {
+            "node": "Gemini: extract products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: extract products": {
+      "main": [
+        [
+          {
+            "node": "Validate products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate products": {
+      "main": [
+        [
+          {
+            "node": "Save products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save products": {
+      "main": [
+        [
+          {
+            "node": "Seed fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark skipped pages": {
+      "main": [
+        [
+          {
+            "node": "Record skip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record skip": {
+      "main": [
+        [
+          {
+            "node": "Seed fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "active": false
+}

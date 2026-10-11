@@ -282,9 +282,165 @@ def build_matching() -> Workflow:
     return wf
 
 
+# --------------------------------------------------------------------------- #
+# Workflow A: loan product discovery (crawler)
+# --------------------------------------------------------------------------- #
+
+CRAWLER_USER_AGENT = "LoanEligibilityEngineBot/0.1 (student assignment; polite, once per day)"
+
+SQL_LOAD_SOURCES = """
+SELECT source_site, url, content_hash AS previous_hash
+  FROM crawl_sources
+ WHERE enabled
+ ORDER BY source_site;
+"""
+
+SQL_RECORD_SKIP = """
+=UPDATE crawl_sources
+    SET last_crawled_at = now(), last_status = {{ $json.q_status }}, last_error = {{ $json.q_error }}
+  WHERE source_site = {{ $json.q_site }}
+RETURNING source_site, last_status;
+"""
+
+# Upsert this page's products, retire products the page no longer lists (only
+# when extraction succeeded), and store the page hash only on success.
+SQL_SAVE_PRODUCTS = """
+=WITH data AS (
+  SELECT * FROM jsonb_to_recordset({{ $json.products_sql }}::jsonb) AS d(
+    product_name text, provider text, interest_rate_min numeric, interest_rate_max numeric,
+    loan_amount_min numeric, loan_amount_max numeric, min_monthly_income numeric,
+    min_credit_score int, max_credit_score int, min_age int, max_age int,
+    allowed_employment text[], extra_criteria_text text)
+), up AS (
+  INSERT INTO loan_products (source_site, product_name, provider, interest_rate_min, interest_rate_max,
+                             loan_amount_min, loan_amount_max, min_monthly_income, min_credit_score,
+                             max_credit_score, min_age, max_age, allowed_employment,
+                             extra_criteria_text, source_url, content_hash, last_seen_at, is_active)
+  SELECT {{ $json.q_site }}, product_name, provider, interest_rate_min, interest_rate_max,
+         loan_amount_min, loan_amount_max, min_monthly_income, min_credit_score, max_credit_score,
+         min_age, max_age, allowed_employment, extra_criteria_text,
+         {{ $json.q_url }}, {{ $json.q_hash }}, now(), TRUE
+    FROM data
+  ON CONFLICT (source_site, product_name) DO UPDATE SET
+    provider = EXCLUDED.provider, interest_rate_min = EXCLUDED.interest_rate_min,
+    interest_rate_max = EXCLUDED.interest_rate_max, loan_amount_min = EXCLUDED.loan_amount_min,
+    loan_amount_max = EXCLUDED.loan_amount_max, min_monthly_income = EXCLUDED.min_monthly_income,
+    min_credit_score = EXCLUDED.min_credit_score, max_credit_score = EXCLUDED.max_credit_score,
+    min_age = EXCLUDED.min_age, max_age = EXCLUDED.max_age,
+    allowed_employment = EXCLUDED.allowed_employment, extra_criteria_text = EXCLUDED.extra_criteria_text,
+    source_url = EXCLUDED.source_url, content_hash = EXCLUDED.content_hash,
+    last_seen_at = now(), is_active = TRUE
+  RETURNING product_id
+), retired AS (
+  UPDATE loan_products SET is_active = FALSE
+   WHERE source_site = {{ $json.q_site }} AND is_active AND {{ $json.q_ok }}
+     AND product_id NOT IN (SELECT product_id FROM up)
+  RETURNING 1
+), src AS (
+  UPDATE crawl_sources
+     SET last_crawled_at = now(), last_status = {{ $json.q_status }}, last_error = {{ $json.q_error }},
+         last_product_count = (SELECT count(*) FROM up),
+         content_hash = CASE WHEN {{ $json.q_ok }} THEN {{ $json.q_hash }} ELSE content_hash END
+   WHERE source_site = {{ $json.q_site }}
+  RETURNING 1
+)
+SELECT {{ $json.q_site }} AS source_site, {{ $json.q_status }} AS status,
+       (SELECT count(*) FROM up)::int AS upserted, (SELECT count(*) FROM retired)::int AS retired,
+       (SELECT count(*) FROM src)::int AS source_updated;
+"""
+
+# Seed products are a fallback: active only while fewer than 5 crawled products
+# are. Idempotent, so it is harmless that both branches lead here.
+SQL_SEED_FALLBACK = """
+WITH crawled AS (
+  SELECT count(*) AS n FROM loan_products WHERE source_site <> 'seed' AND is_active
+), upd AS (
+  UPDATE loan_products SET is_active = ((SELECT n FROM crawled) < 5)
+   WHERE source_site = 'seed'
+  RETURNING is_active
+)
+SELECT (SELECT n FROM crawled)::int AS crawled_active_products,
+       COALESCE(bool_or(is_active), FALSE) AS seed_products_active
+  FROM upd;
+"""
+
+
+def build_discovery() -> Workflow:
+    wf = Workflow("lnDiscoveryWflA1", "A - Loan Product Discovery")
+    step = 240
+
+    def at(col: int, row: int = 0) -> tuple[int, int]:
+        return (col * step, 300 + row * 180)
+
+    schedule = wf.node(
+        "Daily at 02:00", "scheduleTrigger", 1.2,
+        {"rule": {"interval": [{"field": "cronExpression", "expression": "0 2 * * *"}]}},
+        pos=at(0, -1),
+    )
+    crawl_now = wf.node(
+        "Webhook: crawl now", "webhook", 2,
+        {"httpMethod": "POST", "path": "crawl-now", "authentication": "headerAuth",
+         "responseMode": "onReceived", "options": {"responseCode": 202}},
+        pos=at(0, 1), credentials="webhook_secret", webhookId="9e4d2c1a-7b3f-4a8e-b6d5-3c2a1f0e9d84",
+    )
+    sources = wf.postgres("Load sources", SQL_LOAD_SOURCES, pos=at(1), executeOnce=True)
+    fetch = wf.node(
+        "Fetch page", "httpRequest", 4.2,
+        {"method": "GET", "url": "={{ $json.url }}",
+         "sendHeaders": True,
+         "headerParameters": {"parameters": [
+             {"name": "User-Agent", "value": CRAWLER_USER_AGENT},
+             {"name": "Accept", "value": "text/html"}]},
+         "options": {
+             "timeout": 30000,
+             "response": {"response": {"responseFormat": "text", "outputPropertyName": "html"}},
+             # Politeness: one request at a time, 2 s apart.
+             "batching": {"batch": {"batchSize": 1, "batchInterval": 2000}},
+         }},
+        pos=at(2), retryOnFail=True, maxTries=2, waitBetweenTries=5000, onError="continueRegularOutput",
+    )
+    clean = wf.code("Clean to loan text", "A/clean_page.js", pos=at(3))
+    hash_ = wf.node(
+        "SHA-256 of text", "crypto", 1,
+        {"action": "hash", "type": "SHA256", "value": "={{ $json.text }}", "dataPropertyName": "text_hash"},
+        pos=at(4),
+    )
+    changed = if_node(
+        wf, "Changed since last extraction?",
+        "={{ $json.fetch_ok && $json.useful && $json.text_hash !== $json.previous_hash }}",
+        {"type": "boolean", "operation": "true", "singleValue": True}, pos=at(5),
+    )
+    build_req = wf.code("Build extract request", "A/build_extract_request.js", pos=at(6, -1))
+    gemini = wf.node(
+        "Gemini: extract products", "httpRequest", 4.2,
+        {"method": "POST",
+         "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $json.model }}:generateContent",
+         "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+         "sendBody": True, "specifyBody": "json",
+         "jsonBody": "={{ JSON.stringify($json.request_body) }}",
+         "options": {"timeout": 180000, "batching": {"batch": {"batchSize": 1, "batchInterval": 4000}}}},
+        pos=at(7, -1), credentials="gemini",
+        retryOnFail=True, maxTries=3, waitBetweenTries=10000, onError="continueRegularOutput",
+    )
+    validate = wf.code("Validate products", "A/validate_products.js", pos=at(8, -1))
+    save = wf.postgres("Save products", SQL_SAVE_PRODUCTS, pos=at(9, -1))
+    skip = wf.code("Mark skipped pages", "A/record_skip.js", pos=at(6, 1))
+    record_skip = wf.postgres("Record skip", SQL_RECORD_SKIP, pos=at(7, 1))
+    fallback = wf.postgres("Seed fallback", SQL_SEED_FALLBACK, pos=at(10), executeOnce=True)
+
+    wf.connect(schedule, sources)
+    wf.connect(crawl_now, sources)
+    wf.chain(sources, fetch, clean, hash_, changed)
+    wf.connect(changed, build_req, 0)
+    wf.connect(changed, skip, 1)
+    wf.chain(build_req, gemini, validate, save, fallback)
+    wf.chain(skip, record_skip, fallback)
+    return wf
+
+
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
-    for wf, filename in [(build_matching(), "B_matching.json")]:
+    for wf, filename in [(build_discovery(), "A_loan_discovery.json"), (build_matching(), "B_matching.json")]:
         path = OUT / filename
         path.write_text(json.dumps(wf.to_json(), indent=2) + "\n")
         print(f"wrote {path.relative_to(HERE.parent)} ({len(wf.nodes)} nodes)")

@@ -67,13 +67,17 @@ CREATE TABLE IF NOT EXISTS loan_products (
   UNIQUE (source_site, product_name)
 );
 
--- Per-source crawl state so Workflow A can skip unchanged pages without an LLM call.
+-- Pages Workflow A crawls, plus per-page state so it can skip unchanged pages
+-- without an LLM call. Add or disable a source here; no workflow edit needed.
 CREATE TABLE IF NOT EXISTS crawl_sources (
-  source_site      TEXT PRIMARY KEY,
-  url              TEXT NOT NULL,
-  content_hash     TEXT,
-  last_crawled_at  TIMESTAMPTZ,
-  last_status      TEXT
+  source_site         TEXT PRIMARY KEY,
+  url                 TEXT NOT NULL,
+  enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+  content_hash        TEXT,          -- SHA-256 of the cleaned page text last extracted
+  last_crawled_at     TIMESTAMPTZ,
+  last_status         TEXT,          -- extracted | unchanged | fetch_failed | extract_failed | no_content
+  last_error          TEXT,
+  last_product_count  INT
 );
 
 CREATE TABLE IF NOT EXISTS matches (
