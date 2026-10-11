@@ -63,7 +63,7 @@ flowchart LR
   end
 
   GEM["Gemini API"]
-  WEB["Loan pages<br/>BankBazaar · Wishfin · ICICI"]
+  WEB["Loan pages<br/>BankBazaar · ICICI"]
   INBOX["Test inbox<br/>you+one@gmail.com"]
 
   UI -- "1 · GET /upload-url" --> API
@@ -306,7 +306,7 @@ flowchart LR
   SKIP --> FB
 ```
 
-**Choosing sources.** Each candidate page was checked for whether its `robots.txt` allows crawling it and whether its loan terms appear in the raw HTML; a plain HTTP crawler can't run JavaScript. **BankBazaar**, **Wishfin** and **ICICI Bank** passed both checks. The rest were rejected:
+**Choosing sources.** Each candidate page was checked for whether its `robots.txt` allows crawling it and whether its loan terms appear in the raw HTML; a plain HTTP crawler can't run JavaScript. **BankBazaar**, **Wishfin** and **ICICI Bank** passed both checks. Wishfin was later disabled (see below), leaving two active sources. The rest were rejected:
 - Paisabazaar and Bajaj Finserv answer bots with 403.
 - HDFC Bank's `robots.txt` disallows its eligibility page.
 - SBI's page returned 404 and IDFC FIRST's returned 500.
@@ -326,7 +326,7 @@ The source list lives in the `crawl_sources` table, so adding or pausing a site 
 - **Failure handling:** if a fetch or extraction fails, the page keeps its old hash and is retried on the next run. Products a page no longer lists are deactivated, but only after a successful extraction.
 - **Fallback:** `sql/seed/seed_products.sql` holds 20 illustrative products, clearly marked `source_site = 'seed'`. They are active **only while fewer than 5 crawled products are**, so a broken crawl never leaves matching with nothing to work with.
 
-**First crawl, measured:** BankBazaar gave 15 products and ICICI gave 2. Wishfin gave none (see [limitations](#limitations-and-next-steps)). Handling layout changes is optional in the brief. Here, extraction is done by an LLM over cleaned text rather than with CSS selectors, so most layout changes don't break it.
+**First crawl, measured:** BankBazaar gave 15 products and ICICI gave 2. Wishfin gave none. Its execution data showed Gemini correctly returning an empty list, because the page has only rates and general advice, with no eligibility terms per lender. Two replacement pages (Wishfin's and BankBazaar's eligibility pages) turned out to be generic as well, so Wishfin is **disabled** in `crawl_sources` rather than costing a wasted LLM call every day. Handling layout changes is optional in the brief. Here, extraction is done by an LLM over cleaned text rather than with CSS selectors, so most layout changes don't break it.
 
 ### Optimization Treasure Hunt (Workflow B)
 
@@ -483,7 +483,7 @@ The figures above come from those runs.
 ## Limitations and next steps
 
 - **Workflow C and the AWS deployment are not done yet.**
-- **Wishfin returns no usable products.** Its page lists rates without per-lender eligibility terms, so every product fails the "must have eligibility terms" check. One wasted Gemini call a day; the source should be disabled or replaced.
+- **Only two sources are active.** Wishfin is disabled because its pages carry no eligibility terms per lender. Most other lenders' pages either block bots, disallow crawling, or need JavaScript; a headless-browser fetch would widen the choice.
 - **Page hashes can change for reasons unrelated to loan terms** (dates, rotating offers), so the real daily skip rate will be lower than the immediate re-crawl suggests.
 - **Few pages state a credit-score minimum,** so most crawled products filter on income, age and employment only.
 - **Rules that depend on data the CSV lacks** (employer, city, business age) are passed through with a verification note rather than decided.
