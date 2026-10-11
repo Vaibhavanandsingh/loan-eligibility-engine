@@ -44,6 +44,16 @@ function cleanRequirement(raw) {
   return out;
 }
 
+function cleanUnknown(raw) {
+  const unknown = raw ?? [];
+  if (!Array.isArray(unknown) || !unknown.every((u) => UNKNOWN_DATA.has(u))) {
+    throw new Error('needs_unknown_data has unknown values');
+  }
+  return unknown;
+}
+
+const cleanNote = (raw) => String(raw ?? '').slice(0, 300);
+
 function compile(raw) {
   if (!['eligibility', 'informational'].includes(raw.kind)) throw new Error(`bad kind ${raw.kind}`);
   const conditions = (raw.conditions ?? []).map((c) => {
@@ -51,19 +61,20 @@ function compile(raw) {
     if (!Array.isArray(when) || when.length === 0 || !when.every((e) => EMPLOYMENT.has(e))) {
       throw new Error('condition has bad when_employment_in');
     }
-    return { when_employment_in: when, require: cleanRequirement(c.require) };
+    return {
+      when_employment_in: when,
+      require: cleanRequirement(c.require),
+      needs_unknown_data: cleanUnknown(c.needs_unknown_data),
+      verification_note: cleanNote(c.verification_note),
+    };
   });
-  const unknown = raw.needs_unknown_data ?? [];
-  if (!Array.isArray(unknown) || !unknown.every((u) => UNKNOWN_DATA.has(u))) {
-    throw new Error('needs_unknown_data has unknown values');
-  }
   return {
     status: 'ok',
     kind: raw.kind,
     require: cleanRequirement(raw.require),
     conditions,
-    needs_unknown_data: unknown,
-    verification_note: String(raw.verification_note ?? '').slice(0, 300),
+    needs_unknown_data: cleanUnknown(raw.needs_unknown_data),
+    verification_note: cleanNote(raw.verification_note),
   };
 }
 

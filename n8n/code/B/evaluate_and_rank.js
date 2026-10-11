@@ -22,16 +22,22 @@ function meets(req, u) {
   return true;
 }
 
+// Verification items come from the rule itself plus only those conditions
+// that apply to this user's employment type.
 function applyRule(rule, u) {
   if (rule.kind === 'informational') return { pass: true, verify: [], note: null };
   if (!meets(rule.require, u)) return { pass: false };
+
+  const verify = new Set(rule.needs_unknown_data ?? []);
+  const notes = verify.size && rule.verification_note ? [rule.verification_note] : [];
   for (const c of rule.conditions ?? []) {
-    if (c.when_employment_in.includes(u.employment_status) && !meets(c.require, u)) {
-      return { pass: false };
-    }
+    if (!c.when_employment_in.includes(u.employment_status)) continue;
+    if (!meets(c.require, u)) return { pass: false };
+    const extra = c.needs_unknown_data ?? [];
+    extra.forEach((v) => verify.add(v));
+    if (extra.length && c.verification_note) notes.push(c.verification_note);
   }
-  const verify = rule.needs_unknown_data ?? [];
-  return { pass: true, verify, note: verify.length ? rule.verification_note || null : null };
+  return { pass: true, verify: [...verify], note: notes.join(' ') || null };
 }
 
 // 0-100: headroom over the credit and income minimums, cheaper rates, and

@@ -103,6 +103,12 @@ def if_node(wf: Workflow, name: str, left: str, operator: dict, right=None, *, p
 
 BATCH_ID = "={{ $('Validate request').first().json.batch_id }}"
 
+# Fingerprint of a product's rule text as compiled. Bump RULES_COMPILER_VERSION
+# whenever the compile prompt or schema changes: every rule then no longer
+# matches its stored hash and is recompiled on the next run.
+RULES_COMPILER_VERSION = "v2"
+RULE_HASH = f"md5('{RULES_COMPILER_VERSION}:' || extra_criteria_text)"
+
 SQL_START_RUN = """
 -- Mark the batch as matching, clear its un-notified matches so a re-run starts
 -- clean (already-emailed matches are kept), and count what we are matching.
@@ -117,13 +123,14 @@ SELECT (SELECT count(*) FROM upd)::int                                  AS batch
        (SELECT count(*) FROM loan_products WHERE is_active)::int        AS active_products;
 """
 
-SQL_LOAD_STALE_RULES = """
--- Products whose text rule has never been compiled, or changed since it was.
-SELECT product_id, product_name, extra_criteria_text, md5(extra_criteria_text) AS text_hash
+SQL_LOAD_STALE_RULES = f"""
+-- Products whose text rule has never been compiled, or changed since it was
+-- (or the compiler itself changed: see RULES_COMPILER_VERSION).
+SELECT product_id, product_name, extra_criteria_text, {RULE_HASH} AS text_hash
   FROM loan_products
  WHERE is_active
    AND extra_criteria_text IS NOT NULL
-   AND compiled_rules_hash IS DISTINCT FROM md5(extra_criteria_text)
+   AND compiled_rules_hash IS DISTINCT FROM {RULE_HASH}
  ORDER BY product_id;
 """
 
@@ -141,12 +148,12 @@ SQL_SAVE_COMPILED = """
 SELECT count(*)::int AS rules_saved FROM upd;
 """
 
-SQL_LOAD_PRODUCTS = """
+SQL_LOAD_PRODUCTS = f"""
 SELECT product_id, product_name, provider,
        interest_rate_min::float8  AS interest_rate_min,
        min_monthly_income::float8 AS min_monthly_income,
        min_credit_score, extra_criteria_text, compiled_rules,
-       compiled_rules_hash IS NOT DISTINCT FROM md5(extra_criteria_text) AS compiled_current
+       compiled_rules_hash IS NOT DISTINCT FROM {RULE_HASH} AS compiled_current
   FROM loan_products
  WHERE is_active;
 """

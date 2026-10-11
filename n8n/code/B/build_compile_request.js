@@ -43,8 +43,10 @@ const responseSchema = {
           properties: {
             when_employment_in: { type: 'ARRAY', items: { type: 'STRING', enum: EMPLOYMENT } },
             require: requirement,
+            needs_unknown_data: { type: 'ARRAY', items: { type: 'STRING', enum: UNKNOWN_DATA } },
+            verification_note: { type: 'STRING' },
           },
-          required: ['when_employment_in', 'require'],
+          required: ['when_employment_in', 'require', 'needs_unknown_data', 'verification_note'],
         },
       },
       needs_unknown_data: { type: 'ARRAY', items: { type: 'STRING', enum: UNKNOWN_DATA } },
@@ -66,12 +68,13 @@ For each product return one object:
 - product_id: copied from the input.
 - kind: "eligibility" if the text can exclude an applicant; "informational" if it only describes pricing, loan limits or preferences and never excludes anyone.
 - require: requirements for every applicant, using only these fields: credit_score_min, monthly_income_min, age_min, age_max, employment_in. Use null for fields the text does not set.
-- conditions: requirements that apply only to some employment types, as [{"when_employment_in": [...], "require": {...}}].
-- needs_unknown_data: facts the rule depends on that are NOT in the applicant data (e.g. employer type, city, years in business, turnover, qualification, tax returns). Empty if none.
-- verification_note: one short sentence for the applicant saying what the lender will verify, or "" if nothing.
+- needs_unknown_data: facts that EVERY applicant must have verified and that are NOT in the applicant data (e.g. employer type, city, years in business, turnover, qualification, tax returns). Empty if none.
+- verification_note: one short sentence for the applicant saying what the lender will verify for every applicant, or "" if nothing.
+- conditions: rules that apply only to some employment types, as [{"when_employment_in": [...], "require": {...}, "needs_unknown_data": [...], "verification_note": "..."}]. Put a fact here, not at the top level, when the text says it applies only to those applicants.
 
 Rules:
-- Never invent thresholds that the text does not state.
+- Never invent thresholds or restrictions that the text does not state.
+- Only set employment_in when the text explicitly limits who may apply by employment type (for example "only salaried applicants"). Describing a business, such as its age or turnover, is not by itself an employment restriction.
 - "Age at loan maturity must not exceed X" with a minimum tenure of T years means age_max = X - T.
 - A threshold that depends on an unknown fact (e.g. a higher income needed in metro cities) must not go into require; list the fact in needs_unknown_data instead.
 - Amounts like "Rs 25,000", "25k", "1 lakh" (= 100000) are INR.
