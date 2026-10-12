@@ -130,7 +130,8 @@ Workflow A runs independently every night and keeps `loan_products` current.
 ├── scripts/
 │   ├── dev_server.py         runs the real handlers locally: a folder in place of S3
 │   ├── local_ingest.py       ingest a CSV from disk, no AWS involved
-│   └── preview_email.py      write Workflow C's stored emails to HTML files
+│   ├── preview_email.py      write Workflow C's stored emails to HTML files
+│   └── refresh_tunnel.sh     check the tunnel; repair it and the Lambda's webhook URL if needed
 ├── tests/                    pytest: validation, ingestion against Postgres, key handling
 └── data/users.csv            the sample from the brief
 ```
@@ -246,7 +247,9 @@ aws iam create-access-key --user-name <N8nSesUserName output> --profile clickpe
    docker compose --profile tunnel up -d tunnel
    docker logs loan-engine-tunnel 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com'
    ```
-   Put that address in `.env` as `N8N_PUBLIC_URL=<url>/` and `N8N_WEBHOOK_URL=<url>/webhook/loan-match`, then run `docker compose up -d n8n`. A quick tunnel gets a new address whenever it restarts. When that happens, update `.env` and run `npx serverless deploy` again so the Lambda calls the new address.
+   Put that address in `.env` as `N8N_PUBLIC_URL=<url>/` and `N8N_WEBHOOK_URL=<url>/webhook/loan-match`, then run `docker compose up -d n8n`.
+
+   **After the first deploy, use `scripts/refresh_tunnel.sh` instead.** A quick tunnel gets a new address whenever it restarts, and Cloudflare can drop it after a network blip. The script checks that the tunnel answers and that the `processCsv` Lambda uses its current address; if both hold, it changes nothing (about 3 s). Otherwise it starts a new tunnel, updates `.env` and n8n, and changes only the Lambda's `N8N_WEBHOOK_URL`, then proves the path: the Lambda holds the new address, and the webhook answers through the tunnel and still refuses calls without the secret (about 40 s). Run it before a demo; `--force` always starts a fresh tunnel.
 5. **Create the schema on RDS:**
    ```bash
    for f in sql/001_schema.sql sql/002_indexes.sql sql/003_crawl_sources.sql; do
