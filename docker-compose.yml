@@ -86,6 +86,19 @@ services:
       retries: 12
     restart: unless-stopped
 
+  # Public HTTPS address for n8n, so the AWS Lambda can call Workflow B's webhook.
+  # Optional:  docker compose --profile tunnel up -d
+  # Prints a https://<random>.trycloudflare.com URL (docker logs loan-engine-tunnel).
+  # A quick tunnel gets a new URL each time it restarts.
+  tunnel:
+    image: cloudflare/cloudflared:2026.9.3
+    container_name: loan-engine-tunnel
+    command: tunnel --no-autoupdate --url http://n8n:5678
+    depends_on:
+      - n8n
+    profiles: [tunnel]
+    restart: unless-stopped
+
 volumes:
   app_db_data:
   n8n_db_data:

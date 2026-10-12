@@ -238,12 +238,12 @@ aws iam create-access-key --user-name <N8nSesUserName output> --profile clickpe
    npx serverless deploy            # about 10 minutes, mostly RDS creation
    npx serverless info --verbose    # API URL, DatabaseEndpoint, UploadBucketName, N8nSesUserName
    ```
-4. **Expose n8n so Lambda can reach it:**
+4. **Expose n8n so Lambda can reach it** (do this before the first deploy, so the Lambda gets the URL):
    ```bash
-   docker run --rm --network loan-eligibility-engine_default cloudflare/cloudflared:latest \
-     tunnel --no-autoupdate --url http://n8n:5678
+   docker compose --profile tunnel up -d tunnel
+   docker logs loan-engine-tunnel 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com'
    ```
-   Put the printed `https://….trycloudflare.com` address in `.env` as `N8N_PUBLIC_URL` and as `N8N_WEBHOOK_URL=<that>/webhook/loan-match`. Then run `docker compose up -d` and `npx serverless deploy` again.
+   Put that address in `.env` as `N8N_PUBLIC_URL=<url>/` and `N8N_WEBHOOK_URL=<url>/webhook/loan-match`, then run `docker compose up -d n8n`. A quick tunnel gets a new address whenever it restarts. When that happens, update `.env` and run `npx serverless deploy` again so the Lambda calls the new address.
 5. **Create the schema on RDS:**
    ```bash
    for f in sql/001_schema.sql sql/002_indexes.sql sql/003_crawl_sources.sql; do
