@@ -31,8 +31,10 @@ CREDENTIALS = {
 class Workflow:
     """Tiny builder: nodes are laid out left to right in the order they are added."""
 
-    def __init__(self, wf_id: str, name: str, error_workflow: str | None = None):
+    def __init__(self, wf_id: str, name: str, error_workflow: str | None = None,
+                 extra_settings: dict | None = None):
         self.id, self.name, self.error_workflow = wf_id, name, error_workflow
+        self.extra_settings = extra_settings or {}
         self.nodes: list[dict] = []
         self.connections: dict[str, dict] = {}
 
@@ -83,6 +85,7 @@ class Workflow:
                 "executionOrder": "v1",
                 "saveManualExecutions": True,
                 **({"errorWorkflow": self.error_workflow} if self.error_workflow else {}),
+                **self.extra_settings,
             },
             "active": False,
         }
@@ -570,24 +573,27 @@ RETRY_WORKFLOW_ID = "lnRetryStuckWfR1"
 
 # Lambda -> n8n is a push over a public tunnel; if that fails the batch is left
 # WEBHOOK_PENDING (or COMPLETED, if the Lambda died before marking it). n8n
-# then pulls instead: anything stuck is re-submitted to Workflow B. The 3-minute
-# grace period covers the Lambda's own retries (~1 minute at most).
+# then pulls instead: anything stuck is re-submitted to Workflow B. The 2-minute
+# grace period covers the Lambda's own retries (under a minute at worst).
 SQL_FIND_STUCK = """
 SELECT batch_id, status
   FROM upload_batches
  WHERE valid_rows > 0
    AND (status = 'WEBHOOK_PENDING'
-        OR (status = 'COMPLETED' AND completed_at < now() - interval '3 minutes'))
+        OR (status = 'COMPLETED' AND completed_at < now() - interval '2 minutes'))
  ORDER BY completed_at
  LIMIT 3;
 """
 
 
 def build_retry() -> Workflow:
+    # Runs every 30 s. Its runs are saved normally: with saveDataSuccessExecution
+    # "none", n8n 2.41 left every run as a phantom "running" record. History is
+    # bounded anyway (EXECUTIONS_DATA_MAX_AGE in docker-compose.yml).
     wf = Workflow(RETRY_WORKFLOW_ID, "R - Retry Stuck Batches", error_workflow=ERROR_WORKFLOW_ID)
     every = wf.node(
-        "Every 5 minutes", "scheduleTrigger", 1.2,
-        {"rule": {"interval": [{"field": "cronExpression", "expression": "*/5 * * * *"}]}},
+        "Every 30 seconds", "scheduleTrigger", 1.2,
+        {"rule": {"interval": [{"field": "seconds", "secondsInterval": 30}]}},
         pos=(0, 300),
     )
     find = wf.postgres("Find stuck batches", SQL_FIND_STUCK, pos=(240, 300), executeOnce=True)

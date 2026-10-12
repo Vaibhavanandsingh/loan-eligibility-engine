@@ -199,9 +199,9 @@ function render(s) {
       match.set('active', s.valid_rows ? 'Starting matching' : 'No valid rows to match');
       return !s.valid_rows;
     case 'WEBHOOK_PENDING':
-      // n8n re-submits stuck batches itself every 5 minutes, so keep waiting.
+      // n8n re-submits stuck batches itself every 30 seconds, so keep waiting.
       ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
-      match.set('warn', 'Rows are saved. The matching service was unreachable; it retries automatically within 5 minutes.');
+      match.set('warn', 'Rows are saved. The matching service was unreachable; it retries automatically within a minute.');
       return false;
     case 'MATCHING':
       ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);

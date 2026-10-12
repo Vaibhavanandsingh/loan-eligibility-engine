@@ -4,7 +4,7 @@
   "nodes": [
     {
       "id": "lnRetryStuckWfR1-01",
-      "name": "Every 5 minutes",
+      "name": "Every 30 seconds",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -15,8 +15,8 @@
         "rule": {
           "interval": [
             {
-              "field": "cronExpression",
-              "expression": "*/5 * * * *"
+              "field": "seconds",
+              "secondsInterval": 30
             }
           ]
         }
@@ -33,7 +33,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT batch_id, status\n  FROM upload_batches\n WHERE valid_rows > 0\n   AND (status = 'WEBHOOK_PENDING'\n        OR (status = 'COMPLETED' AND completed_at < now() - interval '3 minutes'))\n ORDER BY completed_at\n LIMIT 3;",
+        "query": "SELECT batch_id, status\n  FROM upload_batches\n WHERE valid_rows > 0\n   AND (status = 'WEBHOOK_PENDING'\n        OR (status = 'COMPLETED' AND completed_at < now() - interval '2 minutes'))\n ORDER BY completed_at\n LIMIT 3;",
         "options": {}
       },
       "executeOnce": true,
@@ -81,7 +81,7 @@
     }
   ],
   "connections": {
-    "Every 5 minutes": {
+    "Every 30 seconds": {
       "main": [
         [
           {

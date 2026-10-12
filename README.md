@@ -480,9 +480,9 @@ Not every problem is a crash. Expected failures are handled inside the workflows
 
 The Lambda reaches n8n by **pushing** to a webhook through a public tunnel, and that link can fail. It did during testing: Cloudflare deleted the free quick tunnel after a network blip ("Tunnel not found"), and the Lambda marked two uploads `WEBHOOK_PENDING` after its four attempts.
 
-So n8n also **pulls**. Every 5 minutes, Workflow R looks in the database for batches that are `WEBHOOK_PENDING`, or `COMPLETED` for over 3 minutes without matching starting. The 3-minute grace period covers the Lambda's own retries. R re-submits each one to Workflow B through n8n's **local** address, `http://localhost:5678`, so the tunnel is not involved. It picks up at most 3 batches per run, one every 2 s.
+So n8n also **pulls**. Every 30 seconds, Workflow R looks in the database for batches that are `WEBHOOK_PENDING`, or `COMPLETED` for over 2 minutes without matching starting. The 2-minute grace period covers the Lambda's own retries. R re-submits each one to Workflow B through n8n's **local** address, `http://localhost:5678`, so the tunnel is not involved. It picks up at most 3 batches per run, one every 2 s.
 
-The upload page keeps waiting on `WEBHOOK_PENDING` and says so: *"The matching service was unreachable; it retries automatically within 5 minutes."* With no human involved, a broken tunnel delays matching by at most about 5 minutes instead of stopping it.
+The upload page keeps waiting on `WEBHOOK_PENDING` and says so: *"The matching service was unreachable; it retries automatically within a minute."* With no human involved, a broken tunnel delays matching by under a minute instead of stopping it. R's runs are kept like any other and pruned after 7 days.
 
 **Tested:**
 - A batch was set back to `WEBHOOK_PENDING`. At the next 5-minute mark (61 s later), R picked it up, and the batch went through matching and notification (C in dry-run mode for the test).
