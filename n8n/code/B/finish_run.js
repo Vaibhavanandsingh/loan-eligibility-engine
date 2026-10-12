@@ -2,8 +2,8 @@
 
 const request = $('Validate request').first().json;
 const start = $('Start run').first().json;
-const stats = $('Evaluate and rank').first().json.stats;
-const inserted = $input.all().reduce((sum, i) => sum + Number(i.json.inserted ?? 0), 0);
+const stats = $input.first().json; // one row of counts from "Run matching in database"
+const inserted = Number(stats.matches_inserted ?? 0);
 
 let rulesCompiled = 0;
 let llmCalls = 0;

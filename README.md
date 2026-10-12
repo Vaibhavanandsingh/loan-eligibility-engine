@@ -3,7 +3,7 @@
 Upload a CSV of users, and the system finds the personal loan products each user is likely eligible for and tells them. CSV ingestion runs on AWS (S3, Lambda, RDS PostgreSQL). Product discovery, matching and notification run as workflows in a self-hosted **n8n** instance, with Gemini used only where free text has to be understood.
 
 **Measured on the 10,000-user sample:**
-- **On AWS:** the file goes from the browser to S3 to RDS in under 10 s. The Lambda streams and saves all 10,000 rows in 2.3 s, using 110 MB of memory. Matching then runs in n8n.
+- **On AWS:** the file goes from the browser to S3 to RDS in under 10 s. The Lambda streams and saves all 10,000 rows in 2.3 s, using 110 MB of memory. Matching then takes **4–5 s**.
 - **Locally:** matching all 170,000 user-product pairs takes 4 s and makes **no LLM calls**, because each product's free-text rule is compiled by the LLM once and then checked in plain code ([details](#optimization-treasure-hunt-workflow-b)).
 
 | Part | State |
@@ -359,7 +359,7 @@ flowchart TB
 **The stages:**
 
 1. **Scope to the batch.** Only users whose `batch_id` matches the webhook's payload are processed.
-2. **SQL pre-filter.** A single set-based JOIN in Postgres removes every pair that fails a numeric or employment rule, and returns one row per user (with an array of candidate product ids) rather than one per pair, so n8n holds 10,000 items instead of 85,676.
+2. **SQL pre-filter.** A single set-based JOIN removes every pair that fails a numeric or employment rule.
 3. **Compile the rules, once.** Products whose `extra_criteria_text` changed since it was last compiled go to Gemini **together, in one request**. Each comes back as a structured rule:
    ```json
    { "kind": "eligibility",
@@ -373,11 +373,11 @@ flowchart TB
    ```
    - The output is checked against a strict schema: allowed fields, value ranges, known employment types. Anything malformed is stored as `invalid` and never guessed at.
    - The result is saved with `md5('<compiler version>:' || rule text)`. Editing a rule, a crawler update, or a change to the prompt (via the version) triggers recompilation automatically; nothing else does.
-4. **Apply the rules in code.** An n8n Code node checks each candidate pair against its compiled rule.
+4. **Apply the compiled rules.** An n8n Code node ("Plan matching SQL") turns each product's compiled rule into SQL conditions, together with the scoring formula and the top-5 cut, and sends **one statement** to Postgres. The statement is built only from validated numbers, a fixed set of keywords and escaped strings. Matching is therefore decided in n8n but carried out where the data lives (see [Moving the work to the data](#moving-the-work-to-the-data)).
    - Rules that depend on facts the CSV doesn't contain, such as employer type, city or years in business, are not guessed. The match is kept and records what the lender will verify ("Lender will verify your employer category").
    - If a rule couldn't be compiled (Gemini down, invalid output), the pair is kept as `UNVERIFIED` with the original rule text, so matching never blocks on the LLM.
 5. **Score and keep the top 5 per user.** The score weights how far the user clears the credit-score minimum (40%) and the income minimum (30%), plus a lower interest rate (20%) and having nothing left to verify (10%).
-6. **Store the matches idempotently.** Inserts happen in chunks of 5,000 with `ON CONFLICT (user_id, product_id)`. A match that was already emailed is never touched, and re-running a batch produces the same rows.
+6. **Store the matches idempotently.** The same statement inserts with `ON CONFLICT (user_id, product_id)`. A match that was already emailed is never touched, and re-running a batch produces the same rows.
 
 **Measured** (from the `match_runs` table, written by every run):
 
@@ -385,6 +385,7 @@ flowchart TB
 |---|---|---|---|---|---|---|---|---|
 | Crawled products, rules new | 17 | 170,000 | 85,676 | 46,843 | 2,237 | 42,937 | **1** | 30.4 s |
 | Same, nothing changed | 17 | 170,000 | 85,676 | 46,843 | 2,237 | 42,937 | **0** | **4.2 s** |
+| AWS (RDS), in-database matching, nothing changed | 16 | 160,000 | 85,678 | 46,845 | 80 | 42,937 | **0** | **4.0 s** |
 | Seed products, rules new | 20 | 200,000 | 61,689 | 36,009 | 1,047 | 41,492 | **1** | 38.4 s |
 | Same, nothing changed | 20 | 200,000 | 61,689 | 36,009 | 1,047 | 41,492 | **0** | 2.6 s |
 | Seed products, Gemini unavailable | 20 | 200,000 | 61,689 | 36,009 | 0 (36,009 unverified) | 41,492 | 1 (failed) | 15.9 s |
@@ -401,6 +402,17 @@ The time of runs that compile is almost entirely the one Gemini request.
 
 With this design, the LLM cost depends on how many products change, not on how many users are uploaded.
 
+#### Moving the work to the data
+
+The first version brought the candidates into n8n, evaluated them in a Code node, and sent the matches back. That was fine locally (4 s), but against RDS from a laptop n8n it took **74 s**. n8n's own timings showed where the time went: 58 s uploading about 43,000 match rows (about 5 MB), 12 s downloading 10,000 users, and 1.5 s of actual evaluation. Now n8n compiles the rules into one SQL statement and Postgres runs it. Only that statement (about 9 KB) and one row of counts cross the network.
+
+| Same batch on AWS | Data sent between n8n and RDS | Matching time |
+|---|---|---|
+| Evaluate in n8n (before) | ~6 MB | 73.5 s |
+| Generate SQL in n8n, run in Postgres (now) | ~9 KB | **4.0–5.0 s** |
+
+Before switching, both versions ran on the same batch locally, inside a transaction that was rolled back. All **42,937 rows were identical**, down to stage, score, verification items and note.
+
 **Checking the LLM's work.** The first prompt version made two mistakes:
 - It applied a "self-employed: show 3 years of ITR" check to salaried users too.
 - It narrowed two business loans to business owners when the text didn't say so.
@@ -411,7 +423,7 @@ The fix let conditions carry their own verification items, added a prompt rule (
 - The webhook uses **Header Auth** (a wrong secret gets 403) and validates `batch_id` as a UUID (otherwise 400).
 - It **responds 202 before matching starts**, so the Lambda never waits.
 - The Gemini node retries 3 times, and **continues on error** so the run degrades instead of failing.
-- Postgres and Code nodes pass a few large items (whole users, or 5,000-row chunks) rather than one item per pair.
+- No per-pair items ever pass through n8n: matching is one generated statement executed by Postgres.
 
 ### Workflow C: notification (planned)
 
@@ -460,7 +472,7 @@ The deployed stack was tested on 2026-10-12, with n8n's database credential poin
 
 The dead-letter queue stayed empty, and RDS refused an unencrypted connection, as `rds.force_ssl` requires.
 
-**Matching on RDS:** 16 products, giving 160,000 pairs. 85,678 passed SQL, 10 rules were compiled in **1** Gemini call, and 42,937 matches were stored. That run took 74.7 s, most of it the one Gemini call, since RDS had never seen these rules. A second run on the same batch made **no LLM call** and stored the same 42,937 rows (no duplicates). It still took 64.5 s, compared with 4 s against the local database. The difference is the link between n8n and the database: n8n runs on a laptop and sends about 5 MB of match rows to Mumbai over a home connection. With n8n hosted in the same AWS region (EC2 or ECS), that leg is local again.
+**Matching on RDS:** 16 products, giving 160,000 pairs. 85,678 passed SQL, 10 rules were compiled in **1** Gemini call, and 42,937 matches were stored, with no duplicates on re-runs. The first version of Workflow B took 64–74 s here, because n8n on a laptop shipped the rows to and from Mumbai. After [moving the work to the data](#moving-the-work-to-the-data), the same batch matches in **4.0–5.0 s**.
 
 ## Networking and production considerations
 
@@ -509,5 +521,5 @@ The figures above come from those runs.
 - **Rules that depend on data the CSV lacks** (employer, city, business age) are passed through with a verification note rather than decided.
 - **The per-profile LLM fallback** for rules that fail to compile is designed but not built; such pairs are flagged `UNVERIFIED` instead.
 - **LLM extraction varies slightly between crawls.** ICICI's page gave 2 products in one crawl and 1 in another, and the extracted rule texts differ a little. As a result, compiled rules removed 2,237 pairs locally but only 80 on RDS. Validation keeps every product well formed, but a fixed reference set of pages with expected output would make regressions visible.
-- **n8n runs on a laptop and reaches AWS through a free quick tunnel.** Its address changes when the tunnel restarts (the Lambda then needs a redeploy), and the round trips to RDS slow matching down (see the [AWS test run](#aws-test-run)). Hosting n8n in AWS removes both problems.
+- **n8n runs on a laptop and reaches AWS through a free quick tunnel.** The tunnel's address changes when it restarts, and the Lambda then needs a redeploy. Each connection from the laptop to RDS also takes about 0.85 s. Hosting n8n in AWS next to RDS (planned) removes both problems.
 - **The upload page has no authentication.**

@@ -166,43 +166,6 @@ SELECT product_id, product_name, provider,
  WHERE is_active;
 """
 
-# Stage 1: the set-based pre-filter. One JOIN in Postgres removes every pair that
-# fails a numeric or employment rule, and returns one row per user (not per pair)
-# to keep the payload n8n has to hold small.
-SQL_LOAD_CANDIDATES = """
-SELECT u.user_id, u.monthly_income::float8 AS income, u.credit_score, u.age, u.employment_status,
-       array_agg(p.product_id ORDER BY p.product_id) AS product_ids
-  FROM users u
-  JOIN loan_products p
-    ON p.is_active
-   AND u.monthly_income >= COALESCE(p.min_monthly_income, 0)
-   AND u.credit_score   >= COALESCE(p.min_credit_score, 300)
-   AND (p.max_credit_score IS NULL OR u.credit_score <= p.max_credit_score)
-   AND u.age BETWEEN COALESCE(p.min_age, 18) AND COALESCE(p.max_age, 100)
-   AND (p.allowed_employment IS NULL OR u.employment_status = ANY (p.allowed_employment))
- WHERE u.batch_id = $1::uuid
- GROUP BY u.user_id;
-"""
-
-SQL_INSERT_MATCHES = """
-=WITH data AS (
-  SELECT * FROM jsonb_to_recordset({{ $json.sql_payload }}::jsonb)
-    AS d(user_id text, product_id int, match_stage text, score numeric,
-         needs_verification text[], match_note text)
-), ins AS (
-  INSERT INTO matches (user_id, product_id, batch_id, match_stage, score, needs_verification, match_note)
-  SELECT user_id, product_id, '{{ $json.batch_id }}'::uuid, match_stage, score,
-         COALESCE(needs_verification, '{}'), match_note
-    FROM data
-  ON CONFLICT (user_id, product_id) DO UPDATE
-     SET batch_id = EXCLUDED.batch_id, match_stage = EXCLUDED.match_stage, score = EXCLUDED.score,
-         needs_verification = EXCLUDED.needs_verification, match_note = EXCLUDED.match_note
-   WHERE NOT matches.notified           -- never touch a match that was already emailed
-  RETURNING 1
-)
-SELECT count(*)::int AS inserted FROM ins;
-"""
-
 SQL_RECORD_RUN = """
 =WITH run AS (
   INSERT INTO match_runs (batch_id, users_in_batch, active_products, raw_pairs, sql_candidates,
@@ -271,13 +234,13 @@ def build_matching() -> Workflow:
     parse = wf.code("Parse compiled rules", "B/parse_compiled_rules.js", pos=at(9, -2))
     save = wf.postgres("Save compiled rules", SQL_SAVE_COMPILED, pos=at(10, -2))
     products = wf.postgres("Load products", SQL_LOAD_PRODUCTS, pos=at(11, -1))
-    candidates = wf.postgres("Load candidates (SQL pre-filter)", SQL_LOAD_CANDIDATES, pos=at(12, -1),
-                             replacement=BATCH_ID, executeOnce=True, alwaysOutputData=True)
-    evaluate = wf.code("Evaluate and rank", "B/evaluate_and_rank.js", pos=at(13, -1))
-    insert = wf.postgres("Insert matches", SQL_INSERT_MATCHES, pos=at(14, -1))
-    finish = wf.code("Finish run", "B/finish_run.js", pos=at(15, -1))
-    record = wf.postgres("Record run", SQL_RECORD_RUN, pos=at(16, -1))
-    handoff = wf.node("Hand off to Workflow C", "noOp", 1, {}, pos=at(17, -1),
+    # Stages 1-4 run inside Postgres: n8n generates the statement from the compiled
+    # rules, so no user or match rows travel between n8n and the database.
+    plan = wf.code("Plan matching SQL", "B/plan_matching_sql.js", pos=at(12, -1))
+    run = wf.postgres("Run matching in database", "={{ $json.sql }}", pos=at(13, -1))
+    finish = wf.code("Finish run", "B/finish_run.js", pos=at(14, -1))
+    record = wf.postgres("Record run", SQL_RECORD_RUN, pos=at(15, -1))
+    handoff = wf.node("Hand off to Workflow C", "noOp", 1, {}, pos=at(16, -1),
                       notes="Replaced by an Execute Workflow call once Workflow C exists.")
 
     wf.chain(webhook, validate, is_valid)
@@ -286,7 +249,7 @@ def build_matching() -> Workflow:
     wf.chain(accepted, start, stale, build_req, any_rules)
     wf.connect(any_rules, gemini, 0)
     wf.connect(any_rules, products, 1)  # nothing to compile: skip the LLM entirely
-    wf.chain(gemini, parse, save, products, candidates, evaluate, insert, finish, record, handoff)
+    wf.chain(gemini, parse, save, products, plan, run, finish, record, handoff)
     return wf
 
 
