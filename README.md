@@ -2,13 +2,15 @@
 
 Upload a CSV of users, and the system finds the personal loan products each user is likely eligible for and tells them. CSV ingestion runs on AWS (S3, Lambda, RDS PostgreSQL). Product discovery, matching and notification run as workflows in a self-hosted **n8n** instance, with Gemini used only where free text has to be understood.
 
-**Measured on the 10,000-user sample:** ingestion takes 0.4 s. Matching all 170,000 user-product pairs takes 4 s and makes **no LLM calls**, because each product's free-text rule is compiled by the LLM once and then checked in plain code ([details](#optimization-treasure-hunt-workflow-b)).
+**Measured on the 10,000-user sample:**
+- **On AWS:** the file goes from the browser to S3 to RDS in under 10 s. The Lambda streams and saves all 10,000 rows in 2.3 s, using 110 MB of memory. Matching then runs in n8n.
+- **Locally:** matching all 170,000 user-product pairs takes 4 s and makes **no LLM calls**, because each product's free-text rule is compiled by the LLM once and then checked in plain code ([details](#optimization-treasure-hunt-workflow-b)).
 
 | Part | State |
 |---|---|
 | Scalable CSV ingestion (presigned S3 upload, streaming Lambda, chunked upserts) | Done, tested locally |
 | Upload page (`ui/index.html`) | Done |
-| `serverless.yml` (API, Lambdas, S3, RDS, DLQ, SES user) | Done, packaged and validated; **not yet deployed** |
+| `serverless.yml` (API, Lambdas, S3, RDS, DLQ, SES user) | **Deployed to AWS (ap-south-1)** and tested end to end |
 | Workflow A: loan product discovery (crawler) | Done |
 | Workflow B: matching with the optimised funnel | Done |
 | Workflow E: error handler for A and B | Done |
@@ -30,6 +32,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
   - [Workflow C: notification (planned)](#workflow-c-notification-planned)
   - [Workflow E: error handling](#workflow-e-error-handling)
   - [Security](#security)
+- [AWS test run](#aws-test-run)
 - [Networking and production considerations](#networking-and-production-considerations)
 - [Tests](#tests)
 - [Limitations and next steps](#limitations-and-next-steps)
@@ -207,7 +210,7 @@ In n8n: **Overview → Credentials → Create credential**. Names matter only fo
 
 | Credential | Type | Fields | Used by |
 |---|---|---|---|
-| **App DB** | Postgres | Local: host `app-db`, port `5432`, database `loans`, user `loans`, password from `.env`, SSL `disable`.<br/>RDS: host = `DatabaseEndpoint` output of `serverless info --verbose`, port `5432`, database `loans`, user `loans`, password = `RDS_MASTER_PASSWORD`, SSL `require`. | A, B |
+| **App DB** | Postgres | Local: host `app-db`, port `5432`, database `loans`, user `loans`, password from `.env`, SSL `disable`.<br/>RDS: host = `DatabaseEndpoint` output of `serverless info --verbose`, port `5432`, database `loans`, user `loans`, password = `RDS_MASTER_PASSWORD`, SSL `require`, **Ignore SSL Issues on**. n8n does not ship Amazon's certificate authority, so it can't verify the RDS certificate; traffic is still encrypted. In production, load the RDS CA bundle instead. | A, B, E |
 | **Webhook secret (Lambda to n8n)** | Header Auth | Name `X-Webhook-Secret`, Value = `N8N_WEBHOOK_SECRET` from `.env` | B's webhook, A's "crawl now" webhook |
 | **Gemini API key** | Header Auth | Name `x-goog-api-key`, Value = your Gemini key | A (extraction), B (rule compiling) |
 | **AWS (SES)** | AWS | Access key of the `N8nSesUser` IAM user (see below), region `ap-south-1` | C (planned) |
@@ -224,7 +227,7 @@ aws iam create-access-key --user-name <N8nSesUserName output> --profile clickpe
 
 ## Deploy to AWS
 
-> These steps match `serverless.yml`, which packages and validates cleanly (`npx serverless package`: 28 CloudFormation resources). A full deploy has not been run yet.
+> Deployed and tested with these steps on 2026-10-12. `serverless deploy` took 534 s, mostly creating RDS. See [the AWS test run](#aws-test-run) for the results.
 
 1. **AWS CLI profile.** Create an IAM user for deploying, then `aws configure --profile clickpe` (region `ap-south-1`). Check it with `aws sts get-caller-identity --profile clickpe`.
 2. **Settings in `.env`:**
@@ -442,6 +445,23 @@ Not every problem is a crash. Expected failures are handled inside the workflows
 
 ---
 
+## AWS test run
+
+The deployed stack was tested on 2026-10-12, with n8n's database credential pointed at RDS. All calls went through the deployed API with the 10,000-row sample, exactly as the upload page makes them:
+
+| Time | Status (from `GET /status/{id}`) | What happened |
+|---|---|---|
+| 0 s | | `GET /upload-url` returns a presigned URL for the Mumbai bucket, valid 300 s |
+| ~6 s | `PENDING_UPLOAD` | `PUT` of the 1 MB file straight to S3: HTTP 200 |
+| 8.3 s | `PROCESSING` | the S3 event started `processCsv`; 6,000 rows already saved |
+| 9.7 s | `COMPLETED` | 10,000 of 10,000 rows in RDS (Lambda: 2.3 s, 110 MB) |
+| 11.4 s | `MATCHING` | Lambda called the webhook through the tunnel; n8n answered 202 |
+| 84.6 s | `MATCHED` | 42,937 matches for 10,000 users |
+
+The dead-letter queue stayed empty, and RDS refused an unencrypted connection, as `rds.force_ssl` requires.
+
+**Matching on RDS:** 16 products, giving 160,000 pairs. 85,678 passed SQL, 10 rules were compiled in **1** Gemini call, and 42,937 matches were stored. That run took 74.7 s, most of it the one Gemini call, since RDS had never seen these rules. A second run on the same batch made **no LLM call** and stored the same 42,937 rows (no duplicates). It still took 64.5 s, compared with 4 s against the local database. The difference is the link between n8n and the database: n8n runs on a laptop and sends about 5 MB of match rows to Mumbai over a home connection. With n8n hosted in the same AWS region (EC2 or ECS), that leg is local again.
+
 ## Networking and production considerations
 
 Lambda has to reach two things: RDS, and n8n running on a laptop.
@@ -482,10 +502,12 @@ The figures above come from those runs.
 
 ## Limitations and next steps
 
-- **Workflow C and the AWS deployment are not done yet.**
+- **Workflow C is not built yet.**
 - **Only two sources are active.** Wishfin is disabled because its pages carry no eligibility terms per lender. Most other lenders' pages either block bots, disallow crawling, or need JavaScript; a headless-browser fetch would widen the choice.
 - **Page hashes can change for reasons unrelated to loan terms** (dates, rotating offers), so the real daily skip rate will be lower than the immediate re-crawl suggests.
 - **Few pages state a credit-score minimum,** so most crawled products filter on income, age and employment only.
 - **Rules that depend on data the CSV lacks** (employer, city, business age) are passed through with a verification note rather than decided.
 - **The per-profile LLM fallback** for rules that fail to compile is designed but not built; such pairs are flagged `UNVERIFIED` instead.
+- **LLM extraction varies slightly between crawls.** ICICI's page gave 2 products in one crawl and 1 in another, and the extracted rule texts differ a little. As a result, compiled rules removed 2,237 pairs locally but only 80 on RDS. Validation keeps every product well formed, but a fixed reference set of pages with expected output would make regressions visible.
+- **n8n runs on a laptop and reaches AWS through a free quick tunnel.** Its address changes when the tunnel restarts (the Lambda then needs a redeploy), and the round trips to RDS slow matching down (see the [AWS test run](#aws-test-run)). Hosting n8n in AWS removes both problems.
 - **The upload page has no authentication.**

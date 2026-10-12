@@ -21,7 +21,7 @@ CODE = HERE / "code"
 OUT = HERE / "workflows"
 
 CREDENTIALS = {
-    "app_db": {"postgres": {"id": "2wix96Y76qyvwMAI", "name": "App Db(local)"}},
+    "app_db": {"postgres": {"id": "2wix96Y76qyvwMAI", "name": "App DB"}},
     "webhook_secret": {"httpHeaderAuth": {"id": "lnWebhookSecret1", "name": "Webhook secret (Lambda to n8n)"}},
     "gemini": {"httpHeaderAuth": {"id": "lnGeminiApiKey01", "name": "Gemini API key"}},
 }

@@ -126,7 +126,7 @@
       "credentials": {
         "postgres": {
           "id": "2wix96Y76qyvwMAI",
-          "name": "App Db(local)"
+          "name": "App DB"
         }
       }
     },
@@ -148,7 +148,7 @@
       "credentials": {
         "postgres": {
           "id": "2wix96Y76qyvwMAI",
-          "name": "App Db(local)"
+          "name": "App DB"
         }
       }
     },
@@ -260,7 +260,7 @@
       "credentials": {
         "postgres": {
           "id": "2wix96Y76qyvwMAI",
-          "name": "App Db(local)"
+          "name": "App DB"
         }
       }
     },
@@ -281,7 +281,7 @@
       "credentials": {
         "postgres": {
           "id": "2wix96Y76qyvwMAI",
-          "name": "App Db(local)"
+          "name": "App DB"
         }
       }
     },
@@ -306,7 +306,7 @@
       "credentials": {
         "postgres": {
           "id": "2wix96Y76qyvwMAI",
-          "name": "App Db(local)"
+          "name": "App DB"
         }
       }
     },
@@ -340,7 +340,7 @@
       "credentials": {
         "postgres": {
           "id": "2wix96Y76qyvwMAI",
-          "name": "App Db(local)"
+          "name": "App DB"
         }
       }
     },
@@ -374,7 +374,7 @@
       "credentials": {
         "postgres": {
           "id": "2wix96Y76qyvwMAI",
-          "name": "App Db(local)"
+          "name": "App DB"
         }
       }
     },
