@@ -522,7 +522,7 @@ def build_notification() -> Workflow:
          "assignments": {"assignments": [
              assign("batch_id", "={{ $json.batch_id ?? $json.body?.batch_id }}", "string"),
              # dry_run: build and store emails only. ses: send through AWS SES.
-             assign("mode", "dry_run", "string"),
+             assign("mode", "ses", "string"),
              assign("test_inbox", TEST_INBOX, "string"),
              assign("test_recipients", recipients_expr, "array"),
              # Users per batch who get a delivered email in test mode.

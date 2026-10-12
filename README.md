@@ -14,7 +14,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
 | Workflow A: loan product discovery (crawler) | Done |
 | Workflow B: matching with the optimised funnel | Done |
 | Workflow E: error handler for A and B | Done |
-| Workflow C: email notification via SES | Built; dry run tested on AWS. **Real sending waits for SES verification** |
+| Workflow C: email notification via SES | Done: **emails sent and delivered through SES** |
 
 ---
 
@@ -88,11 +88,8 @@ flowchart LR
   A -- "upsert products" --> RDS
   B -- "7 · batch_id" --> C
   C -- "outbox, notified" --> RDS
-  C -. "8 · send (after SES verification)" .-> SES
-  SES -.-> INBOX
-
-  classDef planned stroke-dasharray: 5 4
-  class SES,INBOX planned
+  C -- "8 · send" --> SES
+  SES --> INBOX
 ```
 
 One upload, end to end:
@@ -106,7 +103,7 @@ One upload, end to end:
 7. B hands the batch to Workflow C.
 8. C builds a personalised email per user and sends it through SES, to test-inbox aliases only. Dry-run mode stores the emails instead of sending.
 
-Workflow A runs independently every night and keeps `loan_products` current. Dashed lines are built but not yet live: real SES sending waits for identity verification.
+Workflow A runs independently every night and keeps `loan_products` current.
 
 ---
 
@@ -451,11 +448,20 @@ flowchart LR
 - **Two modes.** `dry_run` builds the emails and stores them in `email_outbox` with status `DRY_RUN`; nothing is sent and no match is marked notified. `ses` sends each email through the AWS SES node; the SES sandbox allows 1 email a second, so throttled sends are retried. Matches are marked `notified` **only after SES returns a MessageId**. A failed send is stored as `FAILED` and retried on the next run, and a re-run never re-sends an email that was already delivered.
 - **Previewing.** `python scripts/preview_email.py [--aws]` writes the stored emails to `previews/*.html`.
 
-**Tested (dry run, on AWS):**
-- B matched the latest upload in 5.9 s, then started C, which finished in 0.9 s.
+**Tested on AWS:**
+- **Real send:**
+  - SES returned a MessageId for all three emails, and 13 matches (3 + 5 + 5) were marked notified.
+  - SES's delivery metrics for that window show 3 sent and 3 delivered, with no bounces, complaints or rejections.
+  - The workflow ran in 5.2 s, and the status API reports `emails_sent: 3`.
+- **Dry run first:** B matched the latest upload in 5.9 s, then started C, which finished in 0.9 s.
 - Three emails were stored: a business owner with 3 products (to `+one`), a self-employed user with 5 (to `+two`) and a salaried user with 5 (to `+three`).
 - No full real address appears in any of them, no match was marked notified, and the batch moved to `NOTIFIED`.
-- The status API reports `emails_dry_run: 3`.
+- The status API reported `emails_dry_run: 3`.
+
+**SES setup used:**
+- The sender and the three aliases were verified as SES identities. In the sandbox, SES only sends to verified addresses.
+- n8n's AWS credential belongs to the `N8nSesUser` IAM user created by `serverless.yml`. Its key was checked to be refused for anything except sending email.
+- The Settings node's `mode` is `ses`; set it to `dry_run` to rehearse without sending.
 
 ### Workflow E: error handling
 
@@ -538,7 +544,7 @@ The figures above come from those runs.
 
 ## Limitations and next steps
 
-- **Real email sending is not live yet:** the SES identities (sender and test aliases) still need verifying. Workflow C runs in dry-run mode until then.
+- **The emails are sent from a Gmail address through SES,** so Gmail may file them under Spam: Amazon's servers are not authorised to send for gmail.com. A domain of your own, verified in SES, fixes that.
 - **Only two sources are active.** Wishfin is disabled because its pages carry no eligibility terms per lender. Most other lenders' pages either block bots, disallow crawling, or need JavaScript; a headless-browser fetch would widen the choice.
 - **Page hashes can change for reasons unrelated to loan terms** (dates, rotating offers), so the real daily skip rate will be lower than the immediate re-crawl suggests.
 - **Few pages state a credit-score minimum,** so most crawled products filter on income, age and employment only.

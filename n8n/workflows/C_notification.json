@@ -64,7 +64,7 @@
             {
               "id": "setting-mode",
               "name": "mode",
-              "value": "dry_run",
+              "value": "ses",
               "type": "string"
             },
             {
