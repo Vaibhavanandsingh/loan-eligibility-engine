@@ -8,7 +8,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
 
 | Part | State |
 |---|---|
-| Scalable CSV ingestion (presigned S3 upload, streaming Lambda, chunked upserts) | Done, tested locally |
+| Scalable CSV ingestion (presigned S3 upload, streaming Lambda, chunked upserts) | Done, **deployed and tested on AWS** |
 | Upload page (`ui/index.html`), served at the API root | Done |
 | `serverless.yml` (API, Lambdas, S3, RDS, DLQ, SES user) | **Deployed to AWS (ap-south-1)** and tested end to end |
 | Workflow A: loan product discovery (crawler) | Done |
@@ -64,6 +64,7 @@ flowchart LR
       A["A · Loan discovery<br/>daily 02:00"]
       B["B · Matching<br/>webhook"]
       C["C · Notification"]
+      R["R · Retry stuck batches<br/>every 30 s"]
     end
   end
 
@@ -92,6 +93,8 @@ flowchart LR
   C -- "outbox, notified" --> RDS
   C -- "8 · send" --> SES
   SES --> INBOX
+  R -. "find stuck batches" .-> RDS
+  R -. "re-submit (local)" .-> B
 ```
 
 One upload, end to end:
@@ -105,17 +108,17 @@ One upload, end to end:
 7. B hands the batch to Workflow C.
 8. C builds a personalised email per user and sends it through SES, to test-inbox aliases only. Dry-run mode stores the emails instead of sending.
 
-Workflow A runs independently every night and keeps `loan_products` current.
+Workflow A runs independently every night and keeps `loan_products` current. Workflow R (dotted lines) re-submits any batch whose step 5 failed, through n8n's local address, so a broken tunnel only delays matching.
 
 ---
 
 ## Repository layout
 
 ```
-├── serverless.yml            AWS stack: HTTP API, 3 Lambdas, S3, RDS, SQS DLQ, SES-only IAM user
+├── serverless.yml            AWS stack: HTTP API, 4 Lambdas, S3, RDS, SQS DLQ, SES-only IAM user
 ├── docker-compose.yml        app Postgres (local stand-in for RDS), n8n, n8n's own Postgres
 ├── src/
-│   ├── handlers/             Lambda entry points: get_upload_url, process_csv, get_status
+│   ├── handlers/             Lambda entry points: serve_ui, get_upload_url, process_csv, get_status
 │   └── lib/                  validation, streaming ingestion, DB connection, n8n webhook client
 ├── sql/
 │   ├── 001_schema.sql        tables (runs automatically on a fresh database)
@@ -132,7 +135,7 @@ Workflow A runs independently every night and keeps `loan_products` current.
 │   ├── local_ingest.py       ingest a CSV from disk, no AWS involved
 │   ├── preview_email.py      write Workflow C's stored emails to HTML files
 │   └── refresh_tunnel.sh     check the tunnel; repair it and the Lambda's webhook URL if needed
-├── tests/                    pytest: validation, ingestion against Postgres, key handling
+├── tests/                    pytest: validation, ingestion against Postgres, key handling, page serving
 └── data/users.csv            the sample from the brief
 ```
 
@@ -154,7 +157,7 @@ cp .env.example .env
 
 docker compose up -d                 # app Postgres on localhost:5433, n8n on http://localhost:5678
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/pytest                     # 34 tests
+.venv/bin/pytest                     # 35 tests
 ```
 
 The schema is created automatically the first time the app database starts.
@@ -211,8 +214,8 @@ In n8n: **Overview → Credentials → Create credential**. Names matter only fo
 
 | Credential | Type | Fields | Used by |
 |---|---|---|---|
-| **App DB** | Postgres | Local: host `app-db`, port `5432`, database `loans`, user `loans`, password from `.env`, SSL `disable`.<br/>RDS: host = `DatabaseEndpoint` output of `serverless info --verbose`, port `5432`, database `loans`, user `loans`, password = `RDS_MASTER_PASSWORD`, SSL `require`, **Ignore SSL Issues on**. n8n does not ship Amazon's certificate authority, so it can't verify the RDS certificate; traffic is still encrypted. In production, load the RDS CA bundle instead. | A, B, E |
-| **Webhook secret (Lambda to n8n)** | Header Auth | Name `X-Webhook-Secret`, Value = `N8N_WEBHOOK_SECRET` from `.env` | B's webhook, A's "crawl now" webhook |
+| **App DB** | Postgres | Local: host `app-db`, port `5432`, database `loans`, user `loans`, password from `.env`, SSL `disable`.<br/>RDS: host = `DatabaseEndpoint` output of `serverless info --verbose`, port `5432`, database `loans`, user `loans`, password = `RDS_MASTER_PASSWORD`, SSL `require`, **Ignore SSL Issues on**. n8n does not ship Amazon's certificate authority, so it can't verify the RDS certificate; traffic is still encrypted. In production, load the RDS CA bundle instead. | A, B, C, E, R |
+| **Webhook secret (Lambda to n8n)** | Header Auth | Name `X-Webhook-Secret`, Value = `N8N_WEBHOOK_SECRET` from `.env` | B's webhook, A's *crawl now* and C's *notify now* webhooks; R sends it when re-submitting to B |
 | **Gemini API key** | Header Auth | Name `x-goog-api-key`, Value = your Gemini key | A (extraction), B (rule compiling) |
 | **AWS SES (send only)** | AWS | Access key of the `N8nSesUser` IAM user (see below), region `ap-south-1` | C (only in `ses` mode) |
 
@@ -289,7 +292,7 @@ To delete everything, run `npx serverless remove`.
 - **It fails visibly.**
   - An unusable file (missing columns, not UTF-8) is marked `FAILED` and not retried.
   - Unexpected errors are retried by Lambda, then land in an **SQS dead-letter queue**.
-  - If n8n is unreachable, the rows stay saved and the batch is marked `WEBHOOK_PENDING` so it can be replayed. The webhook call itself retries three times, waiting 1 s, 2 s and 4 s.
+  - If n8n is unreachable, the rows stay saved and the batch is marked `WEBHOOK_PENDING`; [Workflow R](#workflow-r-self-healing-when-the-webhook-fails) re-submits it automatically. The webhook call itself is tried four times, waiting 1 s, 2 s and 4 s in between.
 - **It reports progress.** The batch row's counts update after every chunk, so `GET /status/{batch_id}` shows progress while a large file is still loading.
 
 **Beyond one Lambda run:** at the local rate a 15-minute Lambda could load millions of rows; RDS over the network will be slower, so that is an upper bound. For files that outgrow one run, split the object by byte range and fan out through SQS, or use a Step Functions Distributed Map.
@@ -346,7 +349,7 @@ flowchart TB
   S["Stage 1 · SQL pre-filter<br/>one JOIN on income, credit score, age, employment<br/>85,676 pairs pass"]
   H["Product has no text rule<br/>38,833 pairs: matched directly"]
   T["Product has a text rule<br/>46,843 pairs"]
-  CR["Stage 2 · compiled-rule check in a Code node<br/>plain comparisons, no LLM<br/>2,237 pairs removed"]
+  CR["Stage 2 · compiled-rule check<br/>SQL generated by n8n, run in Postgres, no LLM<br/>2,237 pairs removed"]
   K["Stage 3 · score and keep top 5 per user<br/>42,937 matches stored"]
   LLM["LLM compiles each new or changed rule ONCE<br/>11 rules in 1 Gemini call<br/>cached by md5 of version + rule text"]
 
@@ -470,7 +473,7 @@ flowchart LR
 
 ### Workflow E: error handling
 
-A and B both name **E · Error Handler** as their n8n *error workflow*, so n8n starts E whenever a production run of either fails.
+A, B, C and R all name **E · Error Handler** as their n8n *error workflow*, so n8n starts E whenever a production run of any of them fails.
 - E records the failed workflow, the step, the error message and a link to that run in the n8n editor, in `workflow_errors`.
 - If the failed run was matching a batch, E marks that batch `FAILED` with a readable reason. Workflow B stores its execution id on the batch when it starts, so E fails exactly the right batch, and only while it is still `MATCHING`.
 - The upload page then stops waiting and tells the two cases apart: *"Matching failed, but your rows are saved"* is different from *"this file is broken, upload it again"*. Matching can be re-run for the batch by calling the webhook again, with no re-upload.
@@ -487,9 +490,12 @@ So n8n also **pulls**. Every 30 seconds, Workflow R looks in the database for ba
 
 The upload page keeps waiting on `WEBHOOK_PENDING` and says so: *"The matching service was unreachable; it retries automatically within a minute."* With no human involved, a broken tunnel delays matching by under a minute instead of stopping it. R's runs are kept like any other and pruned after 7 days.
 
+**Housekeeping in the same run.** R also deletes batches still waiting for an upload more than an hour after their link was issued. The link expires after 5 minutes, so such a batch can never finish; this happens when a browser asks for a link and never uploads. Only empty batches referenced by nothing are removed.
+
 **Tested:**
-- A batch was set back to `WEBHOOK_PENDING`. At the next 5-minute mark (61 s later), R picked it up, and the batch went through matching and notification (C in dry-run mode for the test).
-- The same run also recovered a second upload that had really been stuck during the tunnel outage.
+- R first ran every 5 minutes: a batch set back to `WEBHOOK_PENDING` was picked up 61 s later, at the next check. That same run also recovered a second upload that had really been stuck during the tunnel outage.
+- Now every 30 seconds: a batch marked stuck just after a check, the worst case, was re-submitted 31 s later and matched 2 s after that.
+- Expired-batch cleanup: of two test batches, the one 2 hours old was deleted at the next run, and the one 5 minutes old was kept.
 
 ### Security
 
@@ -541,10 +547,11 @@ Lambda has to reach two things: RDS, and n8n running on a laptop.
 .venv/bin/pytest
 ```
 
-The 34 tests cover:
+The 35 tests cover:
 - row validation: formats, ranges, aliases, missing and short rows, header normalisation
 - ingestion against a real Postgres: counts, rejected line numbers, blank lines, duplicate ids, re-ingesting the same file, chunk boundaries, files missing columns, empty files
 - how batch ids are derived from S3 keys
+- that the API root serves the upload page
 
 The database tests skip themselves if Postgres isn't running.
 
@@ -554,6 +561,8 @@ The n8n workflows were tested end to end against the 10,000-user sample:
 - Gemini unavailable (run degrades to `UNVERIFIED`)
 - rule compiling, re-runs with nothing changed (no duplicates, no LLM call)
 - crawl, then an immediate re-crawl (pages skipped)
+- a dead tunnel: the upload is left `WEBHOOK_PENDING` and Workflow R recovers it
+- real email delivery through SES to the test aliases
 
 The figures above come from those runs.
 
@@ -561,12 +570,12 @@ The figures above come from those runs.
 
 ## Limitations and next steps
 
-- **The emails are sent from a Gmail address through SES,** so Gmail may file them under Spam: Amazon's servers are not authorised to send for gmail.com. A domain of your own, verified in SES, fixes that.
+- **The emails are sent from a Gmail address through SES,** so Gmail files them under Spam: Amazon's servers are not authorised to send for gmail.com (SPF and DKIM don't align). Because the sender and the test inbox are the same Gmail account, Gmail also shows the sender as "me". A domain of your own, verified in SES with DKIM, fixes both. For the demo, a Gmail filter ("Never send it to Spam") brings them to the inbox.
 - **Only two sources are active.** Wishfin is disabled because its pages carry no eligibility terms per lender. Most other lenders' pages either block bots, disallow crawling, or need JavaScript; a headless-browser fetch would widen the choice.
 - **Page hashes can change for reasons unrelated to loan terms** (dates, rotating offers), so the real daily skip rate will be lower than the immediate re-crawl suggests.
 - **Few pages state a credit-score minimum,** so most crawled products filter on income, age and employment only.
 - **Rules that depend on data the CSV lacks** (employer, city, business age) are passed through with a verification note rather than decided.
 - **The per-profile LLM fallback** for rules that fail to compile is designed but not built; such pairs are flagged `UNVERIFIED` instead.
 - **LLM extraction varies slightly between crawls.** ICICI's page gave 2 products in one crawl and 1 in another, and the extracted rule texts differ a little. As a result, compiled rules removed 2,237 pairs locally but only 80 on RDS. Validation keeps every product well formed, but a fixed reference set of pages with expected output would make regressions visible.
-- **n8n runs on a laptop and reaches AWS through a free quick tunnel.** The tunnel's address changes when it restarts, and the Lambda then needs a redeploy. Workflow R keeps uploads from getting stuck meanwhile. Each connection from the laptop to RDS also takes about 0.85 s. Hosting n8n in AWS next to RDS, or a tunnel with a fixed address, removes both problems.
+- **n8n runs on a laptop and reaches AWS through a free quick tunnel.** The tunnel's address changes when it restarts; `scripts/refresh_tunnel.sh` repairs that in about 40 s, and Workflow R keeps uploads from getting stuck meanwhile. Each connection from the laptop to RDS also takes about 0.85 s. Hosting n8n in AWS next to RDS, or a tunnel with a fixed address, removes both problems.
 - **The upload page has no authentication.**

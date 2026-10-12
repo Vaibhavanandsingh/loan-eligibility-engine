@@ -586,6 +586,26 @@ SELECT batch_id, status
 """
 
 
+# A batch row is created when the page asks for an upload link. If the browser
+# never uploads (closed tab, blocked request), the link expires after 5 minutes
+# and the row can never progress. Remove such rows once they are an hour old,
+# and only if nothing references them.
+SQL_DELETE_EXPIRED_EMPTY = """
+WITH gone AS (
+  DELETE FROM upload_batches b
+   WHERE b.status = 'PENDING_UPLOAD' AND b.total_rows = 0 AND b.valid_rows = 0
+     AND b.created_at < now() - interval '1 hour'
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.batch_id = b.batch_id)
+     AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.batch_id = b.batch_id)
+     AND NOT EXISTS (SELECT 1 FROM match_runs r WHERE r.batch_id = b.batch_id)
+     AND NOT EXISTS (SELECT 1 FROM email_outbox o WHERE o.batch_id = b.batch_id)
+     AND NOT EXISTS (SELECT 1 FROM workflow_errors w WHERE w.batch_id = b.batch_id)
+  RETURNING b.batch_id
+)
+SELECT count(*)::int AS expired_batches_deleted FROM gone;
+"""
+
+
 def build_retry() -> Workflow:
     # Runs every 30 s. Its runs are saved normally: with saveDataSuccessExecution
     # "none", n8n 2.41 left every run as a phantom "running" record. History is
@@ -607,7 +627,10 @@ def build_retry() -> Workflow:
          "options": {"timeout": 30000, "batching": {"batch": {"batchSize": 1, "batchInterval": 2000}}}},
         pos=(480, 300), credentials="webhook_secret", onError="continueRegularOutput",
     )
+    cleanup = wf.postgres("Delete expired empty batches", SQL_DELETE_EXPIRED_EMPTY, pos=(240, 480),
+                          executeOnce=True)
     wf.chain(every, find, resubmit)
+    wf.connect(every, cleanup)
     return wf
 
 
