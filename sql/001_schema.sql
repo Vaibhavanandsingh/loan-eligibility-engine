@@ -102,6 +102,25 @@ CREATE TABLE IF NOT EXISTS matches (
   UNIQUE (user_id, product_id)
 );
 
+-- Every email Workflow C builds. In test mode the recipient is always a test
+-- alias; the user's own address is kept only masked, for the record.
+CREATE TABLE IF NOT EXISTS email_outbox (
+  email_id             BIGSERIAL PRIMARY KEY,
+  batch_id             UUID REFERENCES upload_batches(batch_id),
+  user_id              TEXT REFERENCES users(user_id) ON DELETE CASCADE,
+  original_email       TEXT,          -- masked, e.g. d***@example.com
+  recipient            TEXT NOT NULL, -- where it was (or would be) sent
+  subject              TEXT NOT NULL,
+  html                 TEXT NOT NULL,
+  product_ids          INT[] NOT NULL,
+  mode                 TEXT NOT NULL CHECK (mode IN ('dry_run', 'ses')),
+  status               TEXT NOT NULL CHECK (status IN ('DRY_RUN', 'SENT', 'FAILED')),
+  provider_message_id  TEXT,          -- SES MessageId when sent
+  error                TEXT,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (batch_id, user_id, mode)
+);
+
 -- Every failed n8n execution of Workflows A or B, written by the error workflow (E).
 CREATE TABLE IF NOT EXISTS workflow_errors (
   error_id       BIGSERIAL PRIMARY KEY,

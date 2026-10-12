@@ -343,7 +343,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "=WITH run AS (\n  INSERT INTO match_runs (batch_id, users_in_batch, active_products, raw_pairs, sql_candidates,\n                          hard_rule_only, text_rule_pairs, text_rule_rejected, unverified_pairs,\n                          after_top_k, rules_compiled, llm_calls, matches_inserted, duration_ms)\n  VALUES ('{{ $json.batch_id }}'::uuid, {{ $json.users_in_batch }}, {{ $json.active_products }},\n          {{ $json.raw_pairs }}, {{ $json.sql_candidates }}, {{ $json.hard_rule_only }},\n          {{ $json.text_rule_pairs }}, {{ $json.text_rule_rejected }}, {{ $json.unverified_pairs }},\n          {{ $json.after_top_k }}, {{ $json.rules_compiled }}, {{ $json.llm_calls }},\n          {{ $json.matches_inserted }}, {{ $json.duration_ms }})\n  RETURNING run_id\n), upd AS (\n  UPDATE upload_batches SET status = 'MATCHED' WHERE batch_id = '{{ $json.batch_id }}'::uuid RETURNING 1\n)\nSELECT run_id FROM run;",
+        "query": "=WITH run AS (\n  INSERT INTO match_runs (batch_id, users_in_batch, active_products, raw_pairs, sql_candidates,\n                          hard_rule_only, text_rule_pairs, text_rule_rejected, unverified_pairs,\n                          after_top_k, rules_compiled, llm_calls, matches_inserted, duration_ms)\n  VALUES ('{{ $json.batch_id }}'::uuid, {{ $json.users_in_batch }}, {{ $json.active_products }},\n          {{ $json.raw_pairs }}, {{ $json.sql_candidates }}, {{ $json.hard_rule_only }},\n          {{ $json.text_rule_pairs }}, {{ $json.text_rule_rejected }}, {{ $json.unverified_pairs }},\n          {{ $json.after_top_k }}, {{ $json.rules_compiled }}, {{ $json.llm_calls }},\n          {{ $json.matches_inserted }}, {{ $json.duration_ms }})\n  RETURNING run_id\n), upd AS (\n  UPDATE upload_batches SET status = 'MATCHED' WHERE batch_id = '{{ $json.batch_id }}'::uuid RETURNING 1\n)\nSELECT run_id, '{{ $json.batch_id }}'::uuid AS batch_id FROM run;",
         "options": {}
       },
       "credentials": {
@@ -355,15 +355,33 @@
     },
     {
       "id": "lnMatchingWflwB1-18",
-      "name": "Hand off to Workflow C",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
+      "name": "Start Workflow C (notify)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
       "position": [
         3840,
         120
       ],
-      "parameters": {},
-      "notes": "Replaced by an Execute Workflow call once Workflow C exists."
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "lnNotifyWflowC1",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
     }
   ],
   "connections": {
@@ -550,7 +568,7 @@
       "main": [
         [
           {
-            "node": "Hand off to Workflow C",
+            "node": "Start Workflow C (notify)",
             "type": "main",
             "index": 0
           }

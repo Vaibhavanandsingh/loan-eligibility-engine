@@ -7,3 +7,4 @@ node_modules/
 .serverless/
 .DS_Store
 .dev-s3/
+previews/

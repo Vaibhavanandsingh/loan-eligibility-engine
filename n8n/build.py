@@ -24,6 +24,7 @@ CREDENTIALS = {
     "app_db": {"postgres": {"id": "2wix96Y76qyvwMAI", "name": "App DB"}},
     "webhook_secret": {"httpHeaderAuth": {"id": "lnWebhookSecret1", "name": "Webhook secret (Lambda to n8n)"}},
     "gemini": {"httpHeaderAuth": {"id": "lnGeminiApiKey01", "name": "Gemini API key"}},
+    "aws_ses": {"aws": {"id": "lnAwsSesSender01", "name": "AWS SES (send only)"}},
 }
 
 
@@ -180,7 +181,7 @@ SQL_RECORD_RUN = """
 ), upd AS (
   UPDATE upload_batches SET status = 'MATCHED' WHERE batch_id = '{{ $json.batch_id }}'::uuid RETURNING 1
 )
-SELECT run_id FROM run;
+SELECT run_id, '{{ $json.batch_id }}'::uuid AS batch_id FROM run;
 """
 
 
@@ -240,8 +241,17 @@ def build_matching() -> Workflow:
     run = wf.postgres("Run matching in database", "={{ $json.sql }}", pos=at(13, -1))
     finish = wf.code("Finish run", "B/finish_run.js", pos=at(14, -1))
     record = wf.postgres("Record run", SQL_RECORD_RUN, pos=at(15, -1))
-    handoff = wf.node("Hand off to Workflow C", "noOp", 1, {}, pos=at(16, -1),
-                      notes="Replaced by an Execute Workflow call once Workflow C exists.")
+    handoff = wf.node(
+        "Start Workflow C (notify)", "executeWorkflow", 1.2,
+        {"source": "database",
+         "workflowId": {"__rl": True, "value": NOTIFY_WORKFLOW_ID, "mode": "id"},
+         "workflowInputs": {"mappingMode": "defineBelow", "value": {}, "matchingColumns": [], "schema": [],
+                            "attemptToConvertTypes": False, "convertFieldsToString": True},
+         "mode": "once",
+         # Matching is finished and recorded; notification runs on its own.
+         "options": {"waitForSubWorkflow": False}},
+        pos=at(16, -1),
+    )
 
     wf.chain(webhook, validate, is_valid)
     wf.connect(is_valid, accepted, 0)
@@ -410,6 +420,149 @@ def build_discovery() -> Workflow:
 
 
 # --------------------------------------------------------------------------- #
+# Workflow C: user notification
+# --------------------------------------------------------------------------- #
+
+NOTIFY_WORKFLOW_ID = "lnNotifyWflowC1"
+
+# Test-mode settings, editable in the n8n editor (Settings node).
+TEST_INBOX = "vaibhavanandsingh24@gmail.com"
+TEST_RECIPIENTS = [f"vaibhavanandsingh24+{n}@gmail.com" for n in ("one", "two", "three")]
+
+# Pick the delivery set inside Postgres: up to N users with un-notified matches,
+# one per employment type first (so the test emails differ visibly), best score
+# first. Only those users' matches and product details come back to n8n.
+SQL_LOAD_DELIVERY_SET = """
+WITH pending AS (
+  SELECT user_id, max(score) AS best
+    FROM matches
+   WHERE batch_id = $1::uuid AND NOT notified
+   GROUP BY user_id
+), ranked AS (
+  SELECT p.user_id, p.best,
+         row_number() OVER (PARTITION BY u.employment_status ORDER BY p.best DESC, p.user_id) AS r
+    FROM pending p JOIN users u USING (user_id)
+), chosen AS (
+  SELECT user_id FROM ranked ORDER BY r, best DESC, user_id LIMIT $2
+)
+SELECT u.user_id, u.name, u.email, u.monthly_income::float8 AS income, u.credit_score, u.age,
+       u.employment_status,
+       json_agg(json_build_object(
+         'product_id', lp.product_id, 'product_name', lp.product_name, 'provider', lp.provider,
+         'rate_min', lp.interest_rate_min, 'rate_max', lp.interest_rate_max,
+         'amount_max', lp.loan_amount_max, 'min_income', lp.min_monthly_income,
+         'min_score', lp.min_credit_score, 'score', m.score,
+         'verify', m.needs_verification, 'note', m.match_note, 'url', lp.source_url
+       ) ORDER BY m.score DESC, lp.product_id) AS products
+  FROM chosen c
+  JOIN users u USING (user_id)
+  JOIN matches m ON m.user_id = u.user_id AND m.batch_id = $1::uuid AND NOT m.notified
+  JOIN loan_products lp ON lp.product_id = m.product_id
+ GROUP BY u.user_id;
+"""
+
+# One outbox row per email (re-runs update it). Matches are marked notified only
+# for SENT, i.e. after SES accepted the message, so a failure is retried later.
+SQL_RECORD_EMAIL = """
+=WITH saved AS (
+  INSERT INTO email_outbox (batch_id, user_id, original_email, recipient, subject, html, product_ids,
+                            mode, status, provider_message_id, error)
+  VALUES ({{ $json.q_batch }}::uuid, {{ $json.q_user }}, {{ $json.q_original }}, {{ $json.q_recipient }},
+          {{ $json.q_subject }}, {{ $json.q_html }}, {{ $json.q_products }}, {{ $json.q_mode }},
+          {{ $json.q_status }}, {{ $json.q_message_id }}, {{ $json.q_error }})
+  ON CONFLICT (batch_id, user_id, mode) DO UPDATE SET
+    recipient = EXCLUDED.recipient, subject = EXCLUDED.subject, html = EXCLUDED.html,
+    product_ids = EXCLUDED.product_ids, status = EXCLUDED.status,
+    provider_message_id = EXCLUDED.provider_message_id, error = EXCLUDED.error, created_at = now()
+  RETURNING email_id, status
+), notified AS (
+  UPDATE matches SET notified = TRUE, notified_at = now()
+   WHERE {{ $json.q_status }} = 'SENT'
+     AND batch_id = {{ $json.q_batch }}::uuid AND user_id = {{ $json.q_user }}
+     AND product_id = ANY ({{ $json.q_products }}) AND NOT notified
+  RETURNING 1
+)
+SELECT (SELECT email_id FROM saved) AS email_id, (SELECT status FROM saved) AS status,
+       (SELECT count(*) FROM notified)::int AS matches_notified;
+"""
+
+SQL_FINISH_NOTIFICATION = """
+=UPDATE upload_batches SET status = 'NOTIFIED'
+  WHERE batch_id = '{{ $('Check settings').first().json.batch_id }}'::uuid
+    AND status IN ('MATCHED', 'NOTIFIED')
+    AND EXISTS (SELECT 1 FROM email_outbox o
+                 WHERE o.batch_id = upload_batches.batch_id AND o.status IN ('SENT', 'DRY_RUN'))
+RETURNING batch_id, status;
+"""
+
+
+def build_notification() -> Workflow:
+    wf = Workflow(NOTIFY_WORKFLOW_ID, "C - User Notification", error_workflow=ERROR_WORKFLOW_ID)
+    step = 240
+
+    def at(col: int, row: int = 0) -> tuple[int, int]:
+        return (col * step, 300 + row * 180)
+
+    called = wf.node("Called by Workflow B", "executeWorkflowTrigger", 1.1,
+                     {"inputSource": "passthrough"}, pos=at(0, -1))
+    notify_now = wf.node(
+        "Webhook: notify now", "webhook", 2,
+        {"httpMethod": "POST", "path": "notify-now", "authentication": "headerAuth",
+         "responseMode": "onReceived", "options": {"responseCode": 202}},
+        pos=at(0, 1), credentials="webhook_secret", webhookId="3b8e6f2d-1c4a-4f7e-9a2b-6d5c4e3f2a19",
+    )
+
+    def assign(name: str, value, type_: str) -> dict:
+        return {"id": f"setting-{name}", "name": name, "value": value, "type": type_}
+
+    recipients_expr = "={{ " + json.dumps(TEST_RECIPIENTS) + " }}"
+    settings = wf.node(
+        "Settings", "set", 3.4,
+        {"mode": "manual", "includeOtherFields": False,
+         "assignments": {"assignments": [
+             assign("batch_id", "={{ $json.batch_id ?? $json.body?.batch_id }}", "string"),
+             # dry_run: build and store emails only. ses: send through AWS SES.
+             assign("mode", "dry_run", "string"),
+             assign("test_inbox", TEST_INBOX, "string"),
+             assign("test_recipients", recipients_expr, "array"),
+             # Users per batch who get a delivered email in test mode.
+             assign("send_limit", 3, "number"),
+             assign("sender_email", TEST_INBOX, "string"),
+             assign("sender_name", "Loan Eligibility Engine", "string"),
+         ]},
+         "options": {}},
+        pos=at(1),
+    )
+    check = wf.code("Check settings", "C/check_settings.js", pos=at(2))
+    load = wf.postgres("Load delivery set", SQL_LOAD_DELIVERY_SET, pos=at(3),
+                       replacement="={{ $json.batch_id }},{{ $json.send_limit }}")
+    build = wf.code("Build emails", "C/build_emails.js", pos=at(4))
+    send_for_real = if_node(wf, "Send for real?", "={{ $('Check settings').first().json.mode }}",
+                            {"type": "string", "operation": "equals"}, "ses", pos=at(5))
+    ses = wf.node(
+        "AWS SES: send", "awsSes", 1,
+        {"resource": "email", "operation": "send", "isBodyHtml": True,
+         "subject": "={{ $json.subject }}", "body": "={{ $json.html }}",
+         "fromEmail": "={{ $json.from }}", "toAddresses": ["={{ $json.recipient }}"],
+         "additionalFields": {}},
+        pos=at(6, -1), credentials="aws_ses",
+        # The SES sandbox allows 1 email per second; a throttled send is retried.
+        retryOnFail=True, maxTries=3, waitBetweenTries=1500, onError="continueRegularOutput",
+    )
+    prepare = wf.code("Prepare outbox rows", "C/prepare_outbox_rows.js", pos=at(7))
+    record = wf.postgres("Record email", SQL_RECORD_EMAIL, pos=at(8))
+    finish = wf.postgres("Finish notification", SQL_FINISH_NOTIFICATION, pos=at(9), executeOnce=True)
+
+    wf.connect(called, settings)
+    wf.connect(notify_now, settings)
+    wf.chain(settings, check, load, build, send_for_real)
+    wf.connect(send_for_real, ses, 0)
+    wf.connect(send_for_real, prepare, 1)  # dry run: no SES call
+    wf.chain(ses, prepare, record, finish)
+    return wf
+
+
+# --------------------------------------------------------------------------- #
 # Workflow E: error handler (set as the error workflow of A and B)
 # --------------------------------------------------------------------------- #
 
@@ -449,6 +602,7 @@ if __name__ == "__main__":
     for wf, filename in [
         (build_discovery(), "A_loan_discovery.json"),
         (build_matching(), "B_matching.json"),
+        (build_notification(), "C_notification.json"),
         (build_error_handler(), "E_error_handler.json"),
     ]:
         path = OUT / filename

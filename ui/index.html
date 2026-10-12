@@ -209,14 +209,21 @@ function render(s) {
     case 'MATCHED':
       ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
       match.set('done', matched);
-      notify.set(s.notified_matches ? 'active' : '', s.notified_matches
-        ? `${fmt(s.notified_matches)} matches emailed so far` : 'Waiting for the notification workflow');
+      notify.set('active', 'Building personalised emails');
       return false;
-    case 'NOTIFIED':
+    case 'NOTIFIED': {
       ingest.set('done', `${fmt(s.total_rows)} rows · ${rows}`);
       match.set('done', matched);
-      notify.set('done', `${fmt(s.notified_matches)} matches emailed`);
+      const failed = s.emails_failed ? ` · ${fmt(s.emails_failed)} failed (will retry)` : '';
+      if (s.emails_sent) {
+        notify.set('done', `${fmt(s.emails_sent)} emails sent to the test inbox${failed}`);
+      } else if (s.emails_dry_run) {
+        notify.set('done', `Dry run: ${fmt(s.emails_dry_run)} personalised emails built and saved, not sent`);
+      } else {
+        notify.set('warn', `No emails sent${failed}`);
+      }
       return true;
+    }
     case 'FAILED':
       if (s.completed_at && s.valid_rows > 0) {
         // Ingestion finished; the failure happened later, in matching.

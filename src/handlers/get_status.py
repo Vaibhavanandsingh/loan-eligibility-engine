@@ -20,7 +20,13 @@ SELECT b.batch_id, b.status, b.original_name, b.total_rows, b.valid_rows,
        b.invalid_rows, b.error_message, b.created_at, b.completed_at,
        COUNT(m.match_id)                               AS matches,
        COUNT(DISTINCT m.user_id)                       AS matched_users,
-       COUNT(m.match_id) FILTER (WHERE m.notified)     AS notified_matches
+       COUNT(m.match_id) FILTER (WHERE m.notified)     AS notified_matches,
+       (SELECT COUNT(*) FROM email_outbox o
+         WHERE o.batch_id = b.batch_id AND o.status = 'SENT')    AS emails_sent,
+       (SELECT COUNT(*) FROM email_outbox o
+         WHERE o.batch_id = b.batch_id AND o.status = 'DRY_RUN') AS emails_dry_run,
+       (SELECT COUNT(*) FROM email_outbox o
+         WHERE o.batch_id = b.batch_id AND o.status = 'FAILED')  AS emails_failed
   FROM upload_batches b
   LEFT JOIN matches m ON m.batch_id = b.batch_id
  WHERE b.batch_id = %s

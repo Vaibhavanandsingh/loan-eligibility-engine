@@ -14,7 +14,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
 | Workflow A: loan product discovery (crawler) | Done |
 | Workflow B: matching with the optimised funnel | Done |
 | Workflow E: error handler for A and B | Done |
-| Workflow C: email notification via SES | Designed, **not built yet** |
+| Workflow C: email notification via SES | Built; dry run tested on AWS. **Real sending waits for SES verification** |
 
 ---
 
@@ -29,7 +29,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
   - [Ingestion](#ingestion)
   - [Workflow A: crawling strategy](#workflow-a-crawling-strategy)
   - [Optimization Treasure Hunt (Workflow B)](#optimization-treasure-hunt-workflow-b)
-  - [Workflow C: notification (planned)](#workflow-c-notification-planned)
+  - [Workflow C: notification](#workflow-c-notification)
   - [Workflow E: error handling](#workflow-e-error-handling)
   - [Security](#security)
 - [AWS test run](#aws-test-run)
@@ -86,13 +86,13 @@ flowchart LR
   A -- "fetch" --> WEB
   A -- "extract products" --> GEM
   A -- "upsert products" --> RDS
-  B -. "7 · batch_id (planned)" .-> C
-  C -.-> RDS
-  C -. "8 · send (planned)" .-> SES
+  B -- "7 · batch_id" --> C
+  C -- "outbox, notified" --> RDS
+  C -. "8 · send (after SES verification)" .-> SES
   SES -.-> INBOX
 
   classDef planned stroke-dasharray: 5 4
-  class C,SES,INBOX planned
+  class SES,INBOX planned
 ```
 
 One upload, end to end:
@@ -103,10 +103,10 @@ One upload, end to end:
 4. `process_csv` streams the file, validates each row, and upserts users into RDS in chunks of 2,000. Rejected rows are written to `rejected/<batch_id>.csv`.
 5. It calls n8n's Workflow B webhook through the tunnel, with a shared secret header.
 6. Workflow B answers `202` straight away, then matches the batch's users against active products and stores the matches.
-7. B hands the batch to Workflow C (planned).
-8. C emails each matched user's products through SES, to test-inbox aliases only (planned).
+7. B hands the batch to Workflow C.
+8. C builds a personalised email per user and sends it through SES, to test-inbox aliases only. Dry-run mode stores the emails instead of sending.
 
-Workflow A runs independently every night and keeps `loan_products` current. Dashed lines are planned and not built yet.
+Workflow A runs independently every night and keeps `loan_products` current. Dashed lines are built but not yet live: real SES sending waits for identity verification.
 
 ---
 
@@ -124,13 +124,14 @@ Workflow A runs independently every night and keeps `loan_products` current. Das
 │   ├── 003_crawl_sources.sql the pages Workflow A crawls
 │   └── seed/seed_products.sql illustrative fallback products
 ├── n8n/
-│   ├── workflows/            importable workflow JSON (A, B, E)
+│   ├── workflows/            importable workflow JSON (A, B, C, E)
 │   ├── code/                 JavaScript of each n8n Code node, readable and diffable
 │   └── build.py              assembles code + SQL into the workflow JSON
 ├── ui/index.html             upload page (no build step)
 ├── scripts/
 │   ├── dev_server.py         runs the real handlers locally: a folder in place of S3
-│   └── local_ingest.py       ingest a CSV from disk, no AWS involved
+│   ├── local_ingest.py       ingest a CSV from disk, no AWS involved
+│   └── preview_email.py      write Workflow C's stored emails to HTML files
 ├── tests/                    pytest: validation, ingestion against Postgres, key handling
 └── data/users.csv            the sample from the brief
 ```
@@ -165,10 +166,10 @@ The schema is created automatically the first time the app database starts.
 3. Import and activate the workflows:
 
 ```bash
-for f in E_error_handler A_loan_discovery B_matching; do
+for f in E_error_handler C_notification A_loan_discovery B_matching; do
   docker exec loan-engine-n8n n8n import:workflow --input=/workflows/$f.json
 done
-for id in lnErrorHandlerE1 lnDiscoveryWflA1 lnMatchingWflwB1; do
+for id in lnErrorHandlerE1 lnNotifyWflowC1 lnDiscoveryWflA1 lnMatchingWflwB1; do
   docker exec loan-engine-n8n n8n publish:workflow --id=$id
 done
 docker compose restart n8n
@@ -213,7 +214,7 @@ In n8n: **Overview → Credentials → Create credential**. Names matter only fo
 | **App DB** | Postgres | Local: host `app-db`, port `5432`, database `loans`, user `loans`, password from `.env`, SSL `disable`.<br/>RDS: host = `DatabaseEndpoint` output of `serverless info --verbose`, port `5432`, database `loans`, user `loans`, password = `RDS_MASTER_PASSWORD`, SSL `require`, **Ignore SSL Issues on**. n8n does not ship Amazon's certificate authority, so it can't verify the RDS certificate; traffic is still encrypted. In production, load the RDS CA bundle instead. | A, B, E |
 | **Webhook secret (Lambda to n8n)** | Header Auth | Name `X-Webhook-Secret`, Value = `N8N_WEBHOOK_SECRET` from `.env` | B's webhook, A's "crawl now" webhook |
 | **Gemini API key** | Header Auth | Name `x-goog-api-key`, Value = your Gemini key | A (extraction), B (rule compiling) |
-| **AWS (SES)** | AWS | Access key of the `N8nSesUser` IAM user (see below), region `ap-south-1` | C (planned) |
+| **AWS SES (send only)** | AWS | Access key of the `N8nSesUser` IAM user (see below), region `ap-south-1` | C (only in `ses` mode) |
 
 Inside Docker, n8n reaches the app database by its service name `app-db`. `localhost` would point at the n8n container itself, and `5433` is only the port published to your Mac.
 
@@ -425,13 +426,36 @@ The fix let conditions carry their own verification items, added a prompt rule (
 - The Gemini node retries 3 times, and **continues on error** so the run degrades instead of failing.
 - No per-pair items ever pass through n8n: matching is one generated statement executed by Postgres.
 
-### Workflow C: notification (planned)
+### Workflow C: notification
 
-Designed, not built yet:
-- B calls C with the batch id. C loads that batch's un-notified matches grouped per user, and builds one personalised email per user: products ranked, rate range, why the user qualifies, and what will be verified.
-- **CSV addresses are never emailed.** In test mode the recipient is replaced with test aliases (`<you>+one@gmail.com`, `+two`, `+three`), and only the top 3 users of a batch are delivered. Everyone else's email is built and stored but held back, which keeps within SES's sandbox limit of 200 emails a day.
-- Matches are marked `notified` **only after SES confirms the send**, so a crash never double-sends and a failure is retried on the next run.
-- A dry-run mode saves the emails to an `email_outbox` table instead of sending them, for review before SES is set up.
+B starts C with the batch id as soon as matching is recorded (Execute Workflow, without waiting). A *notify now* webhook allows manual runs.
+
+```mermaid
+flowchart LR
+  T1["Called by B"] --> SET
+  T2["Webhook<br/>notify now"] --> SET
+  SET["Settings<br/>mode · test aliases · send limit"] --> CHK["Check settings<br/>aliases must be +aliases<br/>of the test inbox"]
+  CHK --> LOAD["Load delivery set<br/>chosen in Postgres"]
+  LOAD --> BUILD["Build personalised<br/>emails"]
+  BUILD --> Q{"mode = ses?"}
+  Q -- "no (dry run)" --> PREP["Prepare outbox rows"]
+  Q -- "yes" --> SES["AWS SES: send<br/>retries on throttling"]
+  SES --> PREP
+  PREP --> REC["Record email<br/>outbox row; mark notified<br/>only if SENT"]
+  REC --> FIN["Batch → NOTIFIED"]
+```
+
+- **Who gets an email.** The batch has 10,000 matched users, but test emails must go to a test inbox, and the SES sandbox allows 200 a day. So Postgres picks a delivery set of `send_limit` users (3), **one per employment type first**, best match first. The three test emails therefore show visibly different personalisation. Only those users' matches and product details come back to n8n. Building all 10,000 emails in n8n would mean shipping about 30 MB of HTML to RDS for nothing.
+- **What the email says.** A greeting by first name, a profile summary (employment, income, credit score), and the matched products, best first. Each product shows its rate range, maximum amount and a link to the source, plus **why the user qualifies**: "Your monthly income of ₹1.24 lakh meets the ₹30,000 minimum. Your credit score of 800 meets the 700 minimum." It also says what the lender will verify when a rule depends on data the CSV lacks, and ends with a disclaimer that the terms are indicative.
+- **Real addresses are never emailed.** The Settings node holds the test inbox and its aliases (`vaibhavanandsingh24+one/+two/+three@gmail.com`). *Check settings* stops the run if any recipient is not a plus-alias of that inbox. The user's real address appears only masked (`s***@example.com`), in a test-mode banner at the top of the email.
+- **Two modes.** `dry_run` builds the emails and stores them in `email_outbox` with status `DRY_RUN`; nothing is sent and no match is marked notified. `ses` sends each email through the AWS SES node; the SES sandbox allows 1 email a second, so throttled sends are retried. Matches are marked `notified` **only after SES returns a MessageId**. A failed send is stored as `FAILED` and retried on the next run, and a re-run never re-sends an email that was already delivered.
+- **Previewing.** `python scripts/preview_email.py [--aws]` writes the stored emails to `previews/*.html`.
+
+**Tested (dry run, on AWS):**
+- B matched the latest upload in 5.9 s, then started C, which finished in 0.9 s.
+- Three emails were stored: a business owner with 3 products (to `+one`), a self-employed user with 5 (to `+two`) and a salaried user with 5 (to `+three`).
+- No full real address appears in any of them, no match was marked notified, and the batch moved to `NOTIFIED`.
+- The status API reports `emails_dry_run: 3`.
 
 ### Workflow E: error handling
 
@@ -514,7 +538,7 @@ The figures above come from those runs.
 
 ## Limitations and next steps
 
-- **Workflow C is not built yet.**
+- **Real email sending is not live yet:** the SES identities (sender and test aliases) still need verifying. Workflow C runs in dry-run mode until then.
 - **Only two sources are active.** Wishfin is disabled because its pages carry no eligibility terms per lender. Most other lenders' pages either block bots, disallow crawling, or need JavaScript; a headless-browser fetch would widen the choice.
 - **Page hashes can change for reasons unrelated to loan terms** (dates, rotating offers), so the real daily skip rate will be lower than the immediate re-crawl suggests.
 - **Few pages state a credit-score minimum,** so most crawled products filter on income, age and employment only.

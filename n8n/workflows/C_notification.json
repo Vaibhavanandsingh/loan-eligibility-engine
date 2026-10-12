@@ -1,0 +1,401 @@
+{
+  "id": "lnNotifyWflowC1",
+  "name": "C - User Notification",
+  "nodes": [
+    {
+      "id": "lnNotifyWflowC1-01",
+      "name": "Called by Workflow B",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        120
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-02",
+      "name": "Webhook: notify now",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        480
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "notify-now",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "webhookId": "3b8e6f2d-1c4a-4f7e-9a2b-6d5c4e3f2a19",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "lnWebhookSecret1",
+          "name": "Webhook secret (Lambda to n8n)"
+        }
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-03",
+      "name": "Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "setting-batch_id",
+              "name": "batch_id",
+              "value": "={{ $json.batch_id ?? $json.body?.batch_id }}",
+              "type": "string"
+            },
+            {
+              "id": "setting-mode",
+              "name": "mode",
+              "value": "dry_run",
+              "type": "string"
+            },
+            {
+              "id": "setting-test_inbox",
+              "name": "test_inbox",
+              "value": "vaibhavanandsingh24@gmail.com",
+              "type": "string"
+            },
+            {
+              "id": "setting-test_recipients",
+              "name": "test_recipients",
+              "value": "={{ [\"vaibhavanandsingh24+one@gmail.com\", \"vaibhavanandsingh24+two@gmail.com\", \"vaibhavanandsingh24+three@gmail.com\"] }}",
+              "type": "array"
+            },
+            {
+              "id": "setting-send_limit",
+              "name": "send_limit",
+              "value": 3,
+              "type": "number"
+            },
+            {
+              "id": "setting-sender_email",
+              "name": "sender_email",
+              "value": "vaibhavanandsingh24@gmail.com",
+              "type": "string"
+            },
+            {
+              "id": "setting-sender_name",
+              "name": "sender_name",
+              "value": "Loan Eligibility Engine",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-04",
+      "name": "Check settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Validate the Settings node before anything is built or sent.\n//\n// Safety rail: in this assignment real CSV addresses must never be emailed, so\n// every recipient must be a plus-alias of the configured test inbox\n// (e.g. you+one@gmail.com for you@gmail.com). Anything else stops the run.\n\nconst s = $input.first().json;\nconst batchId = String(s.batch_id ?? '').trim().toLowerCase();\nconst mode = String(s.mode ?? '').trim();\nconst inbox = String(s.test_inbox ?? '').trim().toLowerCase();\nconst recipients = (Array.isArray(s.test_recipients) ? s.test_recipients : []).map((r) => String(r).trim().toLowerCase());\nconst limit = Number(s.send_limit);\n\nconst problems = [];\nif (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(batchId)) problems.push('batch_id must be a UUID');\nif (!['dry_run', 'ses'].includes(mode)) problems.push('mode must be dry_run or ses');\nif (!Number.isInteger(limit) || limit < 1 || limit > 10) problems.push('send_limit must be 1-10');\n\nconst [local, domain] = inbox.split('@');\nif (!local || !domain) problems.push('test_inbox must be an email address');\nif (recipients.length === 0) problems.push('test_recipients is empty');\nfor (const r of recipients) {\n  const [rl, rd] = r.split('@');\n  if (rd !== domain || !rl?.startsWith(`${local}+`)) problems.push(`${r} is not a plus-alias of ${inbox}`);\n}\nif (!/^[^@\\s]+@[^@\\s]+$/.test(String(s.sender_email ?? ''))) problems.push('sender_email is not an email address');\n\nif (problems.length) throw new Error(`Workflow C settings invalid: ${problems.join('; ')}`);\n\nreturn [{\n  json: {\n    batch_id: batchId,\n    mode,\n    recipients,\n    send_limit: limit,\n    sender_email: String(s.sender_email).trim(),\n    sender_name: String(s.sender_name ?? 'Loan Eligibility Engine').trim(),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-05",
+      "name": "Load delivery set",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH pending AS (\n  SELECT user_id, max(score) AS best\n    FROM matches\n   WHERE batch_id = $1::uuid AND NOT notified\n   GROUP BY user_id\n), ranked AS (\n  SELECT p.user_id, p.best,\n         row_number() OVER (PARTITION BY u.employment_status ORDER BY p.best DESC, p.user_id) AS r\n    FROM pending p JOIN users u USING (user_id)\n), chosen AS (\n  SELECT user_id FROM ranked ORDER BY r, best DESC, user_id LIMIT $2\n)\nSELECT u.user_id, u.name, u.email, u.monthly_income::float8 AS income, u.credit_score, u.age,\n       u.employment_status,\n       json_agg(json_build_object(\n         'product_id', lp.product_id, 'product_name', lp.product_name, 'provider', lp.provider,\n         'rate_min', lp.interest_rate_min, 'rate_max', lp.interest_rate_max,\n         'amount_max', lp.loan_amount_max, 'min_income', lp.min_monthly_income,\n         'min_score', lp.min_credit_score, 'score', m.score,\n         'verify', m.needs_verification, 'note', m.match_note, 'url', lp.source_url\n       ) ORDER BY m.score DESC, lp.product_id) AS products\n  FROM chosen c\n  JOIN users u USING (user_id)\n  JOIN matches m ON m.user_id = u.user_id AND m.batch_id = $1::uuid AND NOT m.notified\n  JOIN loan_products lp ON lp.product_id = m.product_id\n GROUP BY u.user_id;",
+        "options": {
+          "queryReplacement": "={{ $json.batch_id }},{{ $json.send_limit }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App DB"
+        }
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-06",
+      "name": "Build emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Build one personalised email per user in the delivery set.\n//\n// Input: one item per user, with their un-notified matches (best first) and the\n// product details needed to explain each match. The recipient is ALWAYS a test\n// alias; the user's real address appears only masked, in a test-mode banner.\n\nconst settings = $('Check settings').first().json;\nconst users = $input.all().map((i) => i.json).filter((u) => u.user_id);\nconst today = new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });\n\nconst esc = (v) => String(v ?? '').replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst rupees = (n) => {\n  const v = Number(n);\n  if (!Number.isFinite(v)) return null;\n  if (v >= 1e7) return `\u20b9${+(v / 1e7).toFixed(2)} crore`;\n  if (v >= 1e5) return `\u20b9${+(v / 1e5).toFixed(2)} lakh`;\n  return `\u20b9${v.toLocaleString('en-IN')}`;\n};\nconst pct = (n) => `${+Number(n).toFixed(2)}%`;\nconst mask = (email) => {\n  const [name, domain] = String(email ?? '').split('@');\n  return name && domain ? `${name[0]}***@${domain}` : 'unknown';\n};\nconst EMPLOYMENT = { salaried: 'salaried', self_employed: 'self-employed', business: 'business owner' };\nconst VERIFY = {\n  employer_category: 'employer type', city: 'city of residence', business_vintage: 'years in business',\n  business_turnover: 'business turnover', professional_qualification: 'professional qualification',\n  tax_returns: 'income tax returns', other: 'additional documents', text_rule_not_checked: 'lender-specific conditions',\n};\n\nfunction rateText(p) {\n  if (p.rate_min == null) return 'Rate on request';\n  return p.rate_max != null && p.rate_max !== p.rate_min\n    ? `${pct(p.rate_min)} \u2013 ${pct(p.rate_max)} p.a.`\n    : `From ${pct(p.rate_min)} p.a.`;\n}\n\n// Plain-language reasons this user qualifies, from the product's own thresholds.\nfunction reasons(u, p) {\n  const out = [];\n  if (p.min_income != null) out.push(`Your monthly income of ${rupees(u.income)} meets the ${rupees(p.min_income)} minimum.`);\n  if (p.min_score != null) out.push(`Your credit score of ${u.credit_score} meets the ${p.min_score} minimum.`);\n  out.push(`Open to ${EMPLOYMENT[u.employment_status] ?? u.employment_status} applicants of your age (${u.age}).`);\n  return out;\n}\n\nfunction productBlock(u, p, i) {\n  const amount = p.amount_max != null ? ` \u00b7 up to ${rupees(p.amount_max)}` : '';\n  const verify = (p.verify ?? []).map((v) => VERIFY[v] ?? v);\n  const verifyLine = verify.length\n    ? `<p style=\"margin:8px 0 0;color:#8a5300;font-size:13px\">To confirm: ${esc(p.note || `the lender will check your ${verify.join(', ')}.`)}</p>`\n    : '';\n  const link = p.url ? ` \u00b7 <a href=\"${esc(p.url)}\" style=\"color:#b45309\">Details</a>` : '';\n  return `\n  <tr><td style=\"padding:16px 0;border-top:1px solid #e3e6ec\">\n    <p style=\"margin:0;font-size:12px;color:#6b7280\">#${i + 1} \u00b7 ${esc(p.provider ?? '')}</p>\n    <p style=\"margin:2px 0 0;font-size:16px;font-weight:600;color:#17202e\">${esc(p.product_name)}</p>\n    <p style=\"margin:4px 0 0;font-size:14px;color:#17202e\">${esc(rateText(p))}${esc(amount)}${link}</p>\n    <ul style=\"margin:8px 0 0;padding-left:18px;font-size:13px;color:#374151\">\n      ${reasons(u, p).map((r) => `<li>${esc(r)}</li>`).join('')}\n    </ul>${verifyLine}\n  </td></tr>`;\n}\n\nreturn users.map((u, index) => {\n  const products = u.products ?? [];\n  const firstName = String(u.name ?? '').trim().split(/\\s+/)[0] || 'there';\n  const recipient = settings.recipients[index % settings.recipients.length];\n  const n = products.length;\n  const subject = `${firstName}, you may qualify for ${n} personal loan${n === 1 ? '' : 's'}`;\n\n  const html = `<!doctype html><html><body style=\"margin:0;background:#f4f6f8;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif\">\n<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\" style=\"padding:24px 12px\">\n<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:600px;background:#ffffff;border:1px solid #e3e6ec;border-radius:10px\">\n  <tr><td style=\"padding:12px 24px;background:#fdf0e1;border-radius:10px 10px 0 0;font-size:12px;color:#8a5300\">\n    Test mode: generated for user ${esc(u.user_id)} (${esc(mask(u.email))}) and redirected to this test inbox.\n  </td></tr>\n  <tr><td style=\"padding:24px 24px 8px\">\n    <p style=\"margin:0;font-size:20px;font-weight:600;color:#17202e\">Hi ${esc(firstName)},</p>\n    <p style=\"margin:10px 0 0;font-size:15px;line-height:1.5;color:#374151\">\n      Based on your profile (${esc(EMPLOYMENT[u.employment_status] ?? u.employment_status)}, monthly income ${esc(rupees(u.income))}, credit score ${esc(u.credit_score)}),\n      you appear eligible for these personal loans, best match first.\n    </p>\n  </td></tr>\n  <tr><td style=\"padding:0 24px 8px\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\">\n    ${products.map((p, i) => productBlock(u, p, i)).join('')}\n  </table></td></tr>\n  <tr><td style=\"padding:16px 24px 24px;border-top:1px solid #e3e6ec;font-size:12px;line-height:1.5;color:#6b7280\">\n    Indicative only, not an offer of credit. Rates and criteria come from lenders' public pages as of ${esc(today)};\n    final eligibility, rate and amount are decided by the lender after verification.\n  </td></tr>\n</table></td></tr></table></body></html>`;\n\n  return {\n    json: {\n      batch_id: settings.batch_id,\n      user_id: u.user_id,\n      original_email: mask(u.email),\n      recipient,\n      from: `${settings.sender_name} <${settings.sender_email}>`,\n      subject,\n      html,\n      product_ids: products.map((p) => p.product_id),\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-07",
+      "name": "Send for real?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "Send for real?-cond",
+              "leftValue": "={{ $('Check settings').first().json.mode }}",
+              "rightValue": "ses",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-08",
+      "name": "AWS SES: send",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        120
+      ],
+      "parameters": {
+        "resource": "email",
+        "operation": "send",
+        "isBodyHtml": true,
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "fromEmail": "={{ $json.from }}",
+        "toAddresses": [
+          "={{ $json.recipient }}"
+        ],
+        "additionalFields": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "aws": {
+          "id": "lnAwsSesSender01",
+          "name": "AWS SES (send only)"
+        }
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-09",
+      "name": "Prepare outbox rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Turn each email (and, in SES mode, its send result) into an outbox row.\n//\n// Reached from two branches: dry-run (input = the built emails) or SES (input =\n// one SES response per email, paired back to its email). A match is marked\n// notified only for status SENT, i.e. after SES accepted the message.\n\nconst settings = $('Check settings').first().json;\nconst emails = $('Build emails').all().map((i) => i.json);\nconst sqlText = (v) => (v == null ? 'NULL' : `'${String(v).replace(/'/g, \"''\")}'`);\n\nreturn $input.all().map((item, index) => {\n  const email = emails[item.pairedItem?.item ?? index];\n  let status = 'DRY_RUN';\n  let messageId = null;\n  let error = null;\n\n  if (settings.mode === 'ses') {\n    const r = item.json ?? {};\n    messageId = r.MessageId ?? r.messageId ?? r.SendEmailResult?.MessageId\n      ?? r.SendEmailResponse?.SendEmailResult?.MessageId ?? null;\n    if (r.error || !messageId) {\n      status = 'FAILED';\n      error = String(r.error?.message ?? r.error ?? 'SES returned no MessageId').slice(0, 500);\n    } else {\n      status = 'SENT';\n    }\n  }\n\n  const productIds = email.product_ids.filter(Number.isInteger);\n  return {\n    json: {\n      user_id: email.user_id,\n      recipient: email.recipient,\n      status,\n      q_batch: sqlText(email.batch_id),\n      q_user: sqlText(email.user_id),\n      q_original: sqlText(email.original_email),\n      q_recipient: sqlText(email.recipient),\n      q_subject: sqlText(email.subject),\n      q_html: sqlText(email.html),\n      q_products: `ARRAY[${productIds.join(',')}]::int[]`,\n      q_mode: sqlText(settings.mode),\n      q_status: sqlText(status),\n      q_message_id: sqlText(messageId),\n      q_error: sqlText(error),\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-10",
+      "name": "Record email",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1920,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=WITH saved AS (\n  INSERT INTO email_outbox (batch_id, user_id, original_email, recipient, subject, html, product_ids,\n                            mode, status, provider_message_id, error)\n  VALUES ({{ $json.q_batch }}::uuid, {{ $json.q_user }}, {{ $json.q_original }}, {{ $json.q_recipient }},\n          {{ $json.q_subject }}, {{ $json.q_html }}, {{ $json.q_products }}, {{ $json.q_mode }},\n          {{ $json.q_status }}, {{ $json.q_message_id }}, {{ $json.q_error }})\n  ON CONFLICT (batch_id, user_id, mode) DO UPDATE SET\n    recipient = EXCLUDED.recipient, subject = EXCLUDED.subject, html = EXCLUDED.html,\n    product_ids = EXCLUDED.product_ids, status = EXCLUDED.status,\n    provider_message_id = EXCLUDED.provider_message_id, error = EXCLUDED.error, created_at = now()\n  RETURNING email_id, status\n), notified AS (\n  UPDATE matches SET notified = TRUE, notified_at = now()\n   WHERE {{ $json.q_status }} = 'SENT'\n     AND batch_id = {{ $json.q_batch }}::uuid AND user_id = {{ $json.q_user }}\n     AND product_id = ANY ({{ $json.q_products }}) AND NOT notified\n  RETURNING 1\n)\nSELECT (SELECT email_id FROM saved) AS email_id, (SELECT status FROM saved) AS status,\n       (SELECT count(*) FROM notified)::int AS matches_notified;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App DB"
+        }
+      }
+    },
+    {
+      "id": "lnNotifyWflowC1-11",
+      "name": "Finish notification",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2160,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE upload_batches SET status = 'NOTIFIED'\n  WHERE batch_id = '{{ $('Check settings').first().json.batch_id }}'::uuid\n    AND status IN ('MATCHED', 'NOTIFIED')\n    AND EXISTS (SELECT 1 FROM email_outbox o\n                 WHERE o.batch_id = upload_batches.batch_id AND o.status IN ('SENT', 'DRY_RUN'))\nRETURNING batch_id, status;",
+        "options": {}
+      },
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App DB"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Called by Workflow B": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: notify now": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Check settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check settings": {
+      "main": [
+        [
+          {
+            "node": "Load delivery set",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load delivery set": {
+      "main": [
+        [
+          {
+            "node": "Build emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build emails": {
+      "main": [
+        [
+          {
+            "node": "Send for real?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send for real?": {
+      "main": [
+        [
+          {
+            "node": "AWS SES: send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare outbox rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AWS SES: send": {
+      "main": [
+        [
+          {
+            "node": "Prepare outbox rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare outbox rows": {
+      "main": [
+        [
+          {
+            "node": "Record email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record email": {
+      "main": [
+        [
+          {
+            "node": "Finish notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "lnErrorHandlerE1"
+  },
+  "active": false
+}
