@@ -1,0 +1,113 @@
+{
+  "id": "lnRetryStuckWfR1",
+  "name": "R - Retry Stuck Batches",
+  "nodes": [
+    {
+      "id": "lnRetryStuckWfR1-01",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/5 * * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "lnRetryStuckWfR1-02",
+      "name": "Find stuck batches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT batch_id, status\n  FROM upload_batches\n WHERE valid_rows > 0\n   AND (status = 'WEBHOOK_PENDING'\n        OR (status = 'COMPLETED' AND completed_at < now() - interval '3 minutes'))\n ORDER BY completed_at\n LIMIT 3;",
+        "options": {}
+      },
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "2wix96Y76qyvwMAI",
+          "name": "App DB"
+        }
+      }
+    },
+    {
+      "id": "lnRetryStuckWfR1-03",
+      "name": "Re-submit to Workflow B",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/webhook/loan-match",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ batch_id: $json.batch_id, retried_from: $json.status }) }}",
+        "options": {
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          }
+        }
+      },
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "lnWebhookSecret1",
+          "name": "Webhook secret (Lambda to n8n)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Find stuck batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find stuck batches": {
+      "main": [
+        [
+          {
+            "node": "Re-submit to Workflow B",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "lnErrorHandlerE1"
+  },
+  "active": false
+}

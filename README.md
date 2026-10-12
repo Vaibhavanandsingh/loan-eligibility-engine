@@ -13,7 +13,8 @@ Upload a CSV of users, and the system finds the personal loan products each user
 | `serverless.yml` (API, Lambdas, S3, RDS, DLQ, SES user) | **Deployed to AWS (ap-south-1)** and tested end to end |
 | Workflow A: loan product discovery (crawler) | Done |
 | Workflow B: matching with the optimised funnel | Done |
-| Workflow E: error handler for A and B | Done |
+| Workflow E: error handler for A, B, C, R | Done |
+| Workflow R: re-submits batches whose webhook call failed | Done |
 | Workflow C: email notification via SES | Done: **emails sent and delivered through SES** |
 
 ---
@@ -31,6 +32,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
   - [Optimization Treasure Hunt (Workflow B)](#optimization-treasure-hunt-workflow-b)
   - [Workflow C: notification](#workflow-c-notification)
   - [Workflow E: error handling](#workflow-e-error-handling)
+  - [Workflow R: self-healing when the webhook fails](#workflow-r-self-healing-when-the-webhook-fails)
   - [Security](#security)
 - [AWS test run](#aws-test-run)
 - [Networking and production considerations](#networking-and-production-considerations)
@@ -121,7 +123,7 @@ Workflow A runs independently every night and keeps `loan_products` current.
 │   ├── 003_crawl_sources.sql the pages Workflow A crawls
 │   └── seed/seed_products.sql illustrative fallback products
 ├── n8n/
-│   ├── workflows/            importable workflow JSON (A, B, C, E)
+│   ├── workflows/            importable workflow JSON (A, B, C, E, R)
 │   ├── code/                 JavaScript of each n8n Code node, readable and diffable
 │   └── build.py              assembles code + SQL into the workflow JSON
 ├── ui/index.html             upload page (no build step)
@@ -163,10 +165,10 @@ The schema is created automatically the first time the app database starts.
 3. Import and activate the workflows:
 
 ```bash
-for f in E_error_handler C_notification A_loan_discovery B_matching; do
+for f in E_error_handler C_notification A_loan_discovery B_matching R_retry_stuck; do
   docker exec loan-engine-n8n n8n import:workflow --input=/workflows/$f.json
 done
-for id in lnErrorHandlerE1 lnNotifyWflowC1 lnDiscoveryWflA1 lnMatchingWflwB1; do
+for id in lnErrorHandlerE1 lnNotifyWflowC1 lnDiscoveryWflA1 lnMatchingWflwB1 lnRetryStuckWfR1; do
   docker exec loan-engine-n8n n8n publish:workflow --id=$id
 done
 docker compose restart n8n
@@ -474,6 +476,18 @@ A and B both name **E · Error Handler** as their n8n *error workflow*, so n8n s
 
 Not every problem is a crash. Expected failures are handled inside the workflows instead: Gemini errors degrade to `UNVERIFIED` matches, and failed page fetches are retried the next day.
 
+### Workflow R: self-healing when the webhook fails
+
+The Lambda reaches n8n by **pushing** to a webhook through a public tunnel, and that link can fail. It did during testing: Cloudflare deleted the free quick tunnel after a network blip ("Tunnel not found"), and the Lambda marked two uploads `WEBHOOK_PENDING` after its four attempts.
+
+So n8n also **pulls**. Every 5 minutes, Workflow R looks in the database for batches that are `WEBHOOK_PENDING`, or `COMPLETED` for over 3 minutes without matching starting. The 3-minute grace period covers the Lambda's own retries. R re-submits each one to Workflow B through n8n's **local** address, `http://localhost:5678`, so the tunnel is not involved. It picks up at most 3 batches per run, one every 2 s.
+
+The upload page keeps waiting on `WEBHOOK_PENDING` and says so: *"The matching service was unreachable; it retries automatically within 5 minutes."* With no human involved, a broken tunnel delays matching by at most about 5 minutes instead of stopping it.
+
+**Tested:**
+- A batch was set back to `WEBHOOK_PENDING`. At the next 5-minute mark (61 s later), R picked it up, and the batch went through matching and notification (C in dry-run mode for the test).
+- The same run also recovered a second upload that had really been stuck during the tunnel outage.
+
 ### Security
 
 - **Upload links are narrow:** one key, PUT only, Content-Type pinned to `text/csv`, valid for 5 minutes. The bucket blocks all public access and is encrypted at rest.
@@ -551,5 +565,5 @@ The figures above come from those runs.
 - **Rules that depend on data the CSV lacks** (employer, city, business age) are passed through with a verification note rather than decided.
 - **The per-profile LLM fallback** for rules that fail to compile is designed but not built; such pairs are flagged `UNVERIFIED` instead.
 - **LLM extraction varies slightly between crawls.** ICICI's page gave 2 products in one crawl and 1 in another, and the extracted rule texts differ a little. As a result, compiled rules removed 2,237 pairs locally but only 80 on RDS. Validation keeps every product well formed, but a fixed reference set of pages with expected output would make regressions visible.
-- **n8n runs on a laptop and reaches AWS through a free quick tunnel.** The tunnel's address changes when it restarts, and the Lambda then needs a redeploy. Each connection from the laptop to RDS also takes about 0.85 s. Hosting n8n in AWS next to RDS (planned) removes both problems.
+- **n8n runs on a laptop and reaches AWS through a free quick tunnel.** The tunnel's address changes when it restarts, and the Lambda then needs a redeploy. Workflow R keeps uploads from getting stuck meanwhile. Each connection from the laptop to RDS also takes about 0.85 s. Hosting n8n in AWS next to RDS, or a tunnel with a fixed address, removes both problems.
 - **The upload page has no authentication.**

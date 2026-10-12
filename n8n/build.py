@@ -563,6 +563,49 @@ def build_notification() -> Workflow:
 
 
 # --------------------------------------------------------------------------- #
+# Workflow R: retry batches whose matching never started
+# --------------------------------------------------------------------------- #
+
+RETRY_WORKFLOW_ID = "lnRetryStuckWfR1"
+
+# Lambda -> n8n is a push over a public tunnel; if that fails the batch is left
+# WEBHOOK_PENDING (or COMPLETED, if the Lambda died before marking it). n8n
+# then pulls instead: anything stuck is re-submitted to Workflow B. The 3-minute
+# grace period covers the Lambda's own retries (~1 minute at most).
+SQL_FIND_STUCK = """
+SELECT batch_id, status
+  FROM upload_batches
+ WHERE valid_rows > 0
+   AND (status = 'WEBHOOK_PENDING'
+        OR (status = 'COMPLETED' AND completed_at < now() - interval '3 minutes'))
+ ORDER BY completed_at
+ LIMIT 3;
+"""
+
+
+def build_retry() -> Workflow:
+    wf = Workflow(RETRY_WORKFLOW_ID, "R - Retry Stuck Batches", error_workflow=ERROR_WORKFLOW_ID)
+    every = wf.node(
+        "Every 5 minutes", "scheduleTrigger", 1.2,
+        {"rule": {"interval": [{"field": "cronExpression", "expression": "*/5 * * * *"}]}},
+        pos=(0, 300),
+    )
+    find = wf.postgres("Find stuck batches", SQL_FIND_STUCK, pos=(240, 300), executeOnce=True)
+    # n8n's own local address: works even when the public tunnel is down.
+    resubmit = wf.node(
+        "Re-submit to Workflow B", "httpRequest", 4.2,
+        {"method": "POST", "url": "http://localhost:5678/webhook/loan-match",
+         "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+         "sendBody": True, "specifyBody": "json",
+         "jsonBody": "={{ JSON.stringify({ batch_id: $json.batch_id, retried_from: $json.status }) }}",
+         "options": {"timeout": 30000, "batching": {"batch": {"batchSize": 1, "batchInterval": 2000}}}},
+        pos=(480, 300), credentials="webhook_secret", onError="continueRegularOutput",
+    )
+    wf.chain(every, find, resubmit)
+    return wf
+
+
+# --------------------------------------------------------------------------- #
 # Workflow E: error handler (set as the error workflow of A and B)
 # --------------------------------------------------------------------------- #
 
@@ -603,6 +646,7 @@ if __name__ == "__main__":
         (build_discovery(), "A_loan_discovery.json"),
         (build_matching(), "B_matching.json"),
         (build_notification(), "C_notification.json"),
+        (build_retry(), "R_retry_stuck.json"),
         (build_error_handler(), "E_error_handler.json"),
     ]:
         path = OUT / filename
