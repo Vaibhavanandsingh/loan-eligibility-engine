@@ -106,8 +106,16 @@ package:
     - '!**'
     - 'src/**'
     - '!src/**/__pycache__/**'
+    - 'ui/index.html'
 
 functions:
+  serveUi:
+    handler: src/handlers/serve_ui.handler
+    description: Serves the upload page at the API root (same origin, so no CORS)
+    memorySize: 128
+    events:
+      - httpApi: { path: /, method: GET }
+
   getUploadUrl:
     handler: src/handlers/get_upload_url.handler
     description: Issues a presigned S3 PUT URL and creates the batch row

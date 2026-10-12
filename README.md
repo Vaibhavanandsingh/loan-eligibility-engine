@@ -9,7 +9,7 @@ Upload a CSV of users, and the system finds the personal loan products each user
 | Part | State |
 |---|---|
 | Scalable CSV ingestion (presigned S3 upload, streaming Lambda, chunked upserts) | Done, tested locally |
-| Upload page (`ui/index.html`) | Done |
+| Upload page (`ui/index.html`), served at the API root | Done |
 | `serverless.yml` (API, Lambdas, S3, RDS, DLQ, SES user) | **Deployed to AWS (ap-south-1)** and tested end to end |
 | Workflow A: loan product discovery (crawler) | Done |
 | Workflow B: matching with the optimised funnel | Done |
@@ -97,7 +97,7 @@ flowchart LR
 
 One upload, end to end:
 
-1. The page asks the API for an upload link. `get_upload_url` records the batch and returns a **presigned S3 URL**: a 5-minute permission to PUT one file to `uploads/<batch_id>.csv`.
+1. The page, served by the API itself at `GET /`, asks the API for an upload link. `get_upload_url` records the batch and returns a **presigned S3 URL**: a 5-minute permission to PUT one file to `uploads/<batch_id>.csv`.
 2. The browser uploads the file **straight to S3**. File bytes never pass through API Gateway or a Lambda payload.
 3. S3 emits `ObjectCreated`, which starts `process_csv`.
 4. `process_csv` streams the file, validates each row, and upserts users into RDS in chunks of 2,000. Rejected rows are written to `rejected/<batch_id>.csv`.
@@ -254,7 +254,7 @@ aws iam create-access-key --user-name <N8nSesUserName output> --profile clickpe
    done
    ```
 6. **Point n8n at RDS:** edit the *App DB* credential as described above.
-7. **Open the page:** `ui/index.html?api=<API URL>`. Host the file anywhere, or open it locally.
+7. **Open the page at the API root:** `<API URL>/`. A small Lambda (`serve_ui`) serves `ui/index.html` from the same origin as `/upload-url` and `/status`, so the browser needs no CORS and no `?api=` parameter. Opening the HTML file straight from disk does **not** work: its origin is `null`, and API Gateway sends no CORS header for `null`.
 
 To delete everything, run `npx serverless remove`.
 
