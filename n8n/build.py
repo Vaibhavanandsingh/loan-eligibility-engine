@@ -431,6 +431,9 @@ NOTIFY_WORKFLOW_ID = "lnNotifyWflowC1"
 # Test-mode settings, editable in the n8n editor (Settings node).
 TEST_INBOX = "vaibhavanandsingh24@gmail.com"
 TEST_RECIPIENTS = [f"vaibhavanandsingh24+{n}@gmail.com" for n in ("one", "two", "three")]
+# Sender: a separate alias (verified in SES), so Gmail shows "Loan Eligibility
+# Engine" instead of "me", which it shows when the sender is the inbox itself.
+SENDER_EMAIL = "vaibhavanandsingh24+loanengine@gmail.com"
 
 # Pick the delivery set inside Postgres: up to N users with un-notified matches,
 # one per employment type first (so the test emails differ visibly), best score
@@ -530,7 +533,7 @@ def build_notification() -> Workflow:
              assign("test_recipients", recipients_expr, "array"),
              # Users per batch who get a delivered email in test mode.
              assign("send_limit", 3, "number"),
-             assign("sender_email", TEST_INBOX, "string"),
+             assign("sender_email", SENDER_EMAIL, "string"),
              assign("sender_name", "Loan Eligibility Engine", "string"),
          ]},
          "options": {}},
